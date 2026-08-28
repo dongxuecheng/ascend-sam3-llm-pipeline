@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -15,8 +16,8 @@ from PIL import Image
 from pydantic import ValidationError
 
 from app.clients import parse_detections
-from app.config import Settings
-from app.domain import Candidate, Frame, LLMReply, LLMVerdict
+from app.config import DEFAULT_LLM_SYSTEM_PROMPT, DEFAULT_LLM_USER_PROMPT, Settings
+from app.domain import Candidate, Frame, LLMReply, LLMVerdict, PROMPT_VERSION
 from app.storage import EvidenceStore
 from app.images import ImageTooLarge, InvalidImage, prepare_image
 from app.main import create_app
@@ -133,6 +134,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                         metadata = json.loads(event.metadata.read_text(encoding="utf-8"))
                         self.assertEqual(metadata["llm"]["result"], result)
                         self.assertEqual(metadata["llm"]["model"], "test-model")
+                        self.assertEqual(metadata["llm"]["prompt_version"], PROMPT_VERSION)
+                        self.assertEqual(metadata["sam3"]["class_names"], ["fire", "smoke"])
                         self.assertEqual(metadata["stream_name"], "摄像头一")
                         self.assertEqual(metadata["captured_at"], "2026-08-28T10:00:00+08:00")
                         self.assertEqual(len(metadata["sam3"]["detections"]), 2)
@@ -148,6 +151,75 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(base64.b64decode(url.split(",", 1)[1]), self.data)
                         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
                         self.assertEqual(payload["temperature"], 0)
+                        self.assertEqual(payload["messages"][0]["content"], DEFAULT_LLM_SYSTEM_PROMPT)
+                        self.assertEqual(payload["messages"][1]["content"][1]["text"], DEFAULT_LLM_USER_PROMPT)
+
+    async def test_custom_words_and_prompts_reach_models_and_saved_evidence(self):
+        configured_env = {
+            "SAM3_CLASS_NAMES": " flame, dense smoke, flame ",
+            "LLM_SYSTEM_PROMPT": r"你是现场图像审核助手。\n不要猜测。",
+            "LLM_USER_PROMPT": r'识别火焰或烟雾。\n只输出{"result":"fire|smoke|fire_smoke|none|uncertain","reason":"可见依据"}',
+        }
+        with patch.dict(os.environ, configured_env, clear=True):
+            settings = Settings.from_env()
+        stub = Stub(boxes=[
+            {**BOXES[0], "label": "flame"},
+            {**BOXES[1], "label": "dense smoke"},
+            BOXES[0],  # A label not in the configured list must still be ignored.
+            {**BOXES[0], "label": "flame", "score": 0.3},
+        ], llm_result="fire_smoke")
+        with patch("app.alarm.send_alarm", new=AsyncMock()) as alarm:
+            async with self.running(
+                stub, sam3_class_names=settings.sam3_class_names,
+                llm_system_prompt=settings.llm_system_prompt,
+                llm_user_prompt=settings.llm_user_prompt,
+            ) as (app, client):
+                self.assertEqual((await self.upload(client)).status_code, 202)
+                await app.state.pipeline.drain()
+                alarm.assert_awaited_once()
+                sam_request, llm_request = stub.requests
+                self.assertIn(b'name="class_names"\r\n\r\nflame,dense smoke', sam_request.content)
+                self.assertIn(b'name="confidence"\r\n\r\n0.3', sam_request.content)
+                self.assertIn(b'name="return_mask"\r\n\r\nfalse', sam_request.content)
+                payload = json.loads(llm_request.content)
+                self.assertEqual(payload["messages"][0]["content"], "你是现场图像审核助手。\n不要猜测。")
+                expected_user = configured_env["LLM_USER_PROMPT"].replace("\\n", "\n")
+                self.assertEqual(payload["messages"][1]["content"][1]["text"], expected_user)
+                event = alarm.await_args.args[0]
+                metadata = json.loads(event.metadata.read_text(encoding="utf-8"))
+                self.assertEqual(metadata["sam3"]["class_names"], ["flame", "dense smoke"])
+                self.assertEqual(
+                    [item["label"] for item in metadata["sam3"]["detections"]],
+                    ["flame", "dense smoke"],
+                )
+                self.assertEqual(metadata["llm"]["system_prompt"], payload["messages"][0]["content"])
+                self.assertEqual(metadata["llm"]["user_prompt"], expected_user)
+                self.assertEqual(metadata["llm"]["prompt_version"], settings.llm_prompt_version)
+                self.assertNotEqual(metadata["llm"]["prompt_version"], PROMPT_VERSION)
+                self.assertEqual(metadata["llm"]["result"], "fire_smoke")
+                self.assertEqual(event.original.read_bytes(), self.data)
+                with Image.open(event.annotated) as annotated:
+                    self.assertGreater(annotated.getpixel((10, 60))[2], 150)
+
+    async def test_unrequested_default_labels_do_not_trigger_llm(self):
+        stub = Stub()
+        async with self.running(stub, sam3_class_names="flame,dense smoke") as (app, client):
+            await self.upload(client)
+            await app.state.pipeline.drain()
+            self.assertEqual([r.url.path for r in stub.requests], ["/predict/file"])
+            self.assertEqual(app.state.pipeline.counts["sam3_negative"], 1)
+            self.assertEqual(list(self.root.rglob("metadata.json")), [])
+
+    async def test_custom_prompt_does_not_change_result_schema_or_enable_retries(self):
+        stub = Stub(llm_result="person")
+        with patch("app.alarm.send_alarm", new=AsyncMock()) as alarm:
+            async with self.running(stub, llm_user_prompt='只输出{"result":"person"}') as (app, client):
+                await self.upload(client)
+                await app.state.pipeline.drain()
+                self.assertEqual([r.url.path for r in stub.requests], ["/predict/file", "/v1/chat/completions"])
+                self.assertEqual(app.state.pipeline.counts["llm_failed"], 1)
+                alarm.assert_not_awaited()
+                self.assertEqual(list(self.root.rglob("metadata.json")), [])
 
     async def test_threshold_is_strict_and_no_candidate_never_calls_llm(self):
         stub = Stub(boxes=[
@@ -209,6 +281,25 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls, 2)
             self.assertEqual(app.state.pipeline.counts["llm_failed"], 1)
             self.assertEqual(app.state.pipeline.counts["saved"], 1)
+
+    async def test_upstream_failure_logs_status_without_credentials_or_response_body(self):
+        async def handler(request):
+            if request.url.path == "/predict/file":
+                return httpx.Response(200, json={"results": BOXES})
+            return httpx.Response(401, text="private-model-response")
+
+        async with self.running(handler, llm_api_key="private-api-key") as (app, client):
+            with self.assertLogs("app.pipeline", level="WARNING") as captured:
+                await self.upload(client)
+                await app.state.pipeline.drain()
+            text = "\n".join(captured.output)
+            self.assertIn("llm_failed", text)
+            self.assertIn("machine=machine-1 stream=stream_1", text)
+            self.assertIn("http_status=401", text)
+            self.assertIn("elapsed_ms=", text)
+            self.assertNotIn("private-api-key", text)
+            self.assertNotIn("private-model-response", text)
+            self.assertEqual(app.state.pipeline.counts["llm_failed"], 1)
 
     async def test_sam3_http_or_payload_failure_does_not_call_llm(self):
         for response in (httpx.Response(500), httpx.Response(200, json={"success": False}),
@@ -467,9 +558,36 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(result=result), self.assertRaises(ValidationError):
                 LLMVerdict.model_validate({"result": result})
 
+    def test_invalid_detection_words_and_empty_prompts_fail_startup_validation(self):
+        for value in ("", " ", ",", "fire,,smoke", "fire,", "fire,\nsmoke"):
+            with self.subTest(class_names=value), self.assertRaises(ValidationError):
+                Settings(sam3_class_names=value)
+        for field in ("llm_system_prompt", "llm_user_prompt"):
+            for value in ("", " \t ", r"\n"):
+                with self.subTest(field=field, value=value), self.assertRaises(ValidationError):
+                    Settings(**{field: value})
+
+    def test_prompt_versions_follow_effective_content_and_legacy_env_uses_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            defaults = Settings.from_env()
+        self.assertEqual(defaults.sam3_classes, ("fire", "smoke"))
+        self.assertEqual(defaults.llm_system_prompt, DEFAULT_LLM_SYSTEM_PROMPT)
+        self.assertEqual(defaults.llm_user_prompt, DEFAULT_LLM_USER_PROMPT)
+        self.assertEqual(defaults.llm_prompt_version, PROMPT_VERSION)
+        same_defaults = Settings(llm_user_prompt=DEFAULT_LLM_USER_PROMPT.replace("\n", r"\n"))
+        self.assertEqual(same_defaults.llm_prompt_version, PROMPT_VERSION)
+        custom = Settings(llm_user_prompt=r"自定义第一行\n第二行")
+        equivalent = Settings(llm_user_prompt="自定义第一行\n第二行")
+        self.assertEqual(custom.llm_prompt_version, equivalent.llm_prompt_version)
+        self.assertTrue(custom.llm_prompt_version.startswith("sha256:"))
+        for override in ({"llm_system_prompt": "修改系统指令"}, {"llm_user_prompt": "修改用户指令"}):
+            changed = Settings(**{**custom.model_dump(include={"llm_system_prompt", "llm_user_prompt"}), **override})
+            self.assertNotEqual(changed.llm_prompt_version, custom.llm_prompt_version)
+
     def test_unbounded_queue_or_nonfinite_timeout_cannot_be_configured(self):
         for setting in ({"sam3_queue_size": 0}, {"llm_concurrency": 0},
-                        {"llm_timeout_seconds": float("inf")}, {"sam3_url": "not a URL"}):
+                        {"llm_timeout_seconds": float("inf")}, {"sam3_url": "not a URL"},
+                        {"log_retention_days": 0}, {"log_retention_days": 31}, {"log_level": "INVALID"}):
             with self.subTest(setting=setting), self.assertRaises(ValidationError):
                 Settings(**setting)
 

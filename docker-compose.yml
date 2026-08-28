@@ -18,8 +18,10 @@ services:
       - .env
     environment:
       PIPELINE_DATA_DIR: /data/events
+      PIPELINE_LOG_DIR: /data/logs
     volumes:
       - "${PIPELINE_STORAGE_DIR}:/data/events"
+      - "./data/logs:/data/logs"
     stop_grace_period: 60s
     cap_drop:
       - ALL
@@ -35,8 +37,6 @@ services:
       timeout: 8s
       retries: 3
       start_period: 15s
+    # File logs are the only persistent copy, with a maximum age of 30 days.
     logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "3"
+      driver: "none"

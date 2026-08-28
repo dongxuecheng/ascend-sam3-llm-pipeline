@@ -12,7 +12,8 @@ from uuid import uuid4
 
 from PIL import Image, ImageDraw, ImageFont
 
-from app.domain import Candidate, LLMReply, PROMPT_VERSION, SAM3_THRESHOLD
+from app.config import Settings
+from app.domain import Candidate, LLMReply, SAM3_THRESHOLD
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,8 +25,9 @@ class SavedEvent:
 
 
 class EvidenceStore:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, settings: Settings | None = None):
         self.root = root.resolve()
+        self.settings = settings or Settings()
 
     def initialize(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -66,13 +68,16 @@ class EvidenceStore:
                     "original": original_name, "annotated": "annotated.jpg",
                 },
                 "sam3": {
+                    "class_names": list(self.settings.sam3_classes),
                     "threshold": SAM3_THRESHOLD,
                     "detections": [asdict(detection) for detection in candidate.detections],
                     "elapsed_ms": round(candidate.sam3_elapsed_ms, 2),
                 },
                 "llm": {
                     **reply.verdict.model_dump(), "raw_reply": reply.raw_reply,
-                    "model": reply.model, "prompt_version": PROMPT_VERSION,
+                    "model": reply.model, "prompt_version": self.settings.llm_prompt_version,
+                    "system_prompt": self.settings.llm_system_prompt,
+                    "user_prompt": self.settings.llm_user_prompt,
                     "elapsed_ms": round(llm_elapsed_ms, 2),
                 },
                 "alarm": {"status": "not_configured"},
@@ -107,7 +112,9 @@ class EvidenceStore:
             x1, y1, x2, y2 = detection.box
             x1, x2 = min(canvas.width - 1, x1), min(canvas.width - 1, x2)
             y1, y2 = min(canvas.height - 1, y1), min(canvas.height - 1, y2)
-            color = (255, 48, 48) if detection.label == "fire" else (255, 165, 0)
+            color = {"fire": (255, 48, 48), "smoke": (255, 165, 0)}.get(
+                detection.label, (64, 180, 255),
+            )
             draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width)
             label = f"{detection.label} {detection.score:.2f}"
             bounds = draw.textbbox((0, 0), label, font=font)

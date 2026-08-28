@@ -77,10 +77,13 @@ def main():
     env = {key: value for key, value in os.environ.items() if key not in {
         "PIPELINE_HOST", "PIPELINE_PORT", "PIPELINE_DATA_DIR", "PIPELINE_API_KEY",
         "SAM3_URL", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "CORS_ORIGINS",
+        "SAM3_CLASS_NAMES", "LLM_SYSTEM_PROMPT", "LLM_USER_PROMPT",
+        "PIPELINE_LOG_DIR", "LOG_LEVEL", "LOG_RETENTION_DAYS",
     }}
     env.update({
         "PIPELINE_HOST": "127.0.0.1", "PIPELINE_PORT": str(api_port),
         "PIPELINE_DATA_DIR": str(output / "events"), "PIPELINE_API_KEY": "local-smoke-key",
+        "PIPELINE_LOG_DIR": str(output / "logs"), "LOG_LEVEL": "INFO", "LOG_RETENTION_DAYS": "30",
         "SAM3_URL": f"http://127.0.0.1:{model_port}/predict/file",
         "LLM_BASE_URL": f"http://127.0.0.1:{model_port}/v1",
         "LLM_MODEL": "", "LLM_API_KEY": "", "CORS_ORIGINS": "",
@@ -138,6 +141,13 @@ def main():
                     assert metadata["llm"]["model"] == "http-smoke-model"
                     assert (metadata_file.parent / "original.png").read_bytes() == image_bytes
                     assert (metadata_file.parent / "annotated.jpg").is_file()
+                log_files = list((output / "logs").glob("pipeline-*.log"))
+                assert len(log_files) == 1
+                log_text = log_files[0].read_text(encoding="utf-8")
+                assert "Uvicorn running" in log_text and "pipeline_started" in log_text
+                assert log_text.count(" INFO app.pipeline confirmed ") == 15
+                assert "GET /health" not in log_text
+                assert "local-smoke-key" not in log_text and "data:image" not in log_text
                 (output / "result.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
                 print(json.dumps({"status": "passed", "accepted": 15, "saved": 15,
                                   "output": str(output),

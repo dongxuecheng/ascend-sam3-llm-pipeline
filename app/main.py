@@ -1,6 +1,5 @@
 import asyncio
 import hmac
-import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -71,7 +70,7 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        store = EvidenceStore(settings.pipeline_data_dir)
+        store = EvidenceStore(settings.pipeline_data_dir, settings=settings)
         await asyncio.to_thread(store.initialize)
         connections = settings.sam3_concurrency + settings.llm_concurrency + 2
         async with httpx.AsyncClient(
@@ -151,14 +150,17 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
     return application
 
 
-app = create_app()
+settings = Settings.from_env()
+app = create_app(settings)
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    settings = Settings.from_env()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    # A single API process owns the global queues; never use multiple Uvicorn workers.
-    uvicorn.run(app, host=settings.pipeline_host, port=settings.pipeline_port, workers=1,
-                limit_concurrency=64, timeout_keep_alive=5, timeout_graceful_shutdown=10)
+    from app.logging_setup import configured_logging
+
+    # A single API process owns the global queues and log files.
+    with configured_logging(settings):
+        uvicorn.run(app, host=settings.pipeline_host, port=settings.pipeline_port, workers=1,
+                    log_config=None, limit_concurrency=64, timeout_keep_alive=5,
+                    timeout_graceful_shutdown=10)
