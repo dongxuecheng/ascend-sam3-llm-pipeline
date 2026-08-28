@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -144,6 +144,9 @@ def main():
                 log_files = list((output / "logs").glob("pipeline-*.log"))
                 assert len(log_files) == 1
                 log_text = log_files[0].read_text(encoding="utf-8")
+                log_time = datetime.fromisoformat(log_text.split(" ", 1)[0])
+                assert log_time.utcoffset() == timedelta(hours=8)
+                assert log_files[0].name == f"pipeline-{log_time.date()}.log"
                 assert "Uvicorn running" in log_text and "pipeline_started" in log_text
                 assert log_text.count(" INFO app.pipeline confirmed ") == 15
                 assert "GET /health" not in log_text

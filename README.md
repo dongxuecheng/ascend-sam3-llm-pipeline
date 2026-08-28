@@ -86,7 +86,7 @@ DOCKER_BUILDKIT=0 docker-compose build
 docker-compose up -d --no-build
 docker-compose ps
 curl -fsS http://127.0.0.1:18080/health
-tail -n 100 -f "data/logs/pipeline-$(date -u +%F).log"
+tail -n 100 -f "data/logs/pipeline-$(TZ=Asia/Shanghai date +%F).log"
 ~~~
 
 docker-compose config 可能包含环境变量中的密钥，不要公开分享完整输出。
@@ -257,7 +257,7 @@ data/events/
   smoke 为橙色，自定义标签为蓝色。绘制所有配置类别中通过 0.3 门槛的 SAM3 框，LLM 类别另记入 JSON。
 - metadata.json：机器/视频流信息、采集/接收/确认时间、图片尺寸、SAM3 框和
   置信度、实际检测词、LLM 结论和原始回复、模型名、完整提示词、提示词版本以及两阶段调用耗时。
-- 服务器时间使用 UTC 并带时区；前端提供的采集时间保留其时区。
+- 证据元数据中的服务器时间仍使用 UTC 并带时区；前端提供的采集时间保留其时区。
 - 对含 EXIF 旋转的图片，两个模型接收同一份方向归正的未标注图片；
   原始上传文件仍保持不变，标注图坐标按归正后的尺寸记录。
 - 一组文件先写入临时目录，全部成功后改为正式目录；不会在保存失败后调用报警。
@@ -267,9 +267,13 @@ data/events/
 ## 日志（最多 30 天）
 
 应用、Uvicorn 启停及 HTTP 访问日志统一写入宿主机 data/logs/pipeline-YYYY-MM-DD.log，
-容器内路径为 /data/logs；时间和文件名均使用 UTC，中文使用 UTF-8。
+容器内路径为 /data/logs；日志时间、每日文件名和过期清理均使用北京时间（UTC+08:00），
+不依赖宿主机或容器的时区设置，中文使用 UTF-8。
+日志时间格式示例：2026-08-28T17:00:57.084+08:00。
+已有日志不重写，升级后新增记录使用 +08:00；旧记录中的 Z 仍表示 UTC。
+本次时区调整不改变证据元数据中的时间格式。
 
-- LOG_RETENTION_DAYS 默认 30，可设为 1–30；保留当天及之前 N-1 个 UTC 日期的日志。
+- LOG_RETENTION_DAYS 默认 30，可设为 1–30；保留当天及之前 N-1 个北京时间日期的日志。
   启动立即清理过期文件，运行期间每 60 秒检查一次，即使没有上传也会清理。
   跨日第一条日志会切换文件；若服务停机，清理在下次启动时执行。
 - 只清理日志目录下命名为 pipeline-YYYY-MM-DD.log 的过期普通文件，
@@ -285,11 +289,11 @@ data/events/
 因此 docker-compose logs 不再提供日志；在服务器查看文件：
 
 ~~~bash
-tail -n 100 -f "data/logs/pipeline-$(date -u +%F).log"
+tail -n 100 -f "data/logs/pipeline-$(TZ=Asia/Shanghai date +%F).log"
 ~~~
 
-跨 UTC 日期后重新执行 tail 查看当天文件。仅修改 LOG_LEVEL / LOG_RETENTION_DAYS 后重建容器即可。
-升级此版本需要构建新镜像并重建 pipeline 容器，以应用日志挂载和 Docker 日志驱动变更。
+跨北京时间午夜后重新执行 tail 查看当天文件。仅修改 LOG_LEVEL / LOG_RETENTION_DAYS 后重建容器即可。
+升级日志实现需要构建新镜像并重建 pipeline 容器；仅 restart 不会加载镜像中的新代码。
 若启动失败且日志文件未生成，可在停止原容器后以前台方式查看启动错误：
 
 ~~~bash
@@ -314,9 +318,9 @@ metadata.json 也明确记录 alarm.status=not_configured。
 | LLM_SYSTEM_PROMPT | 原系统提示词 | LLM 系统消息，完整默认值见 .env.example |
 | LLM_USER_PROMPT | 原用户提示词 | LLM 图片判断及 JSON 输出要求，完整默认值见 .env.example |
 | LOG_LEVEL | INFO | 日志级别：DEBUG / INFO / WARNING / ERROR / CRITICAL |
-| LOG_RETENTION_DAYS | 30 | 日志保留的 UTC 日期数，含当天，范围 1–30 |
+| LOG_RETENTION_DAYS | 30 | 日志保留的北京时间日期数，含当天，范围 1–30 |
 | SAM3_CONCURRENCY | 4 | 访问 SAM3 的并发上限 |
-| LLM_CONCURRENCY | 2 | LLM 阶段工作协程数量 |
+| LLM_CONCURRENCY | 2 | LLM 阶段工作协程数量，范围 1–32，不等于 NPU 设备数 |
 | SAM3_QUEUE_SIZE | 15 | 等待 SAM3 的图片数上限 |
 | LLM_QUEUE_SIZE | 15 | 等待 LLM 的候选数上限 |
 | SAM3_TIMEOUT_SECONDS | 15 | 每张图片 SAM3 请求的总期限 |

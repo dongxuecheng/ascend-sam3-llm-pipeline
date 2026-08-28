@@ -1,9 +1,8 @@
-"""UTC daily file logs with age-based cleanup, even when no requests arrive."""
+"""Beijing-time daily logs with age-based cleanup, even without requests."""
 
 import logging
 import re
 import threading
-import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -12,10 +11,18 @@ from app.config import Settings
 
 
 CLEANUP_INTERVAL_SECONDS = 60
+# Keep timestamps and calendar dates independent of the host timezone and tzdata.
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
-def utc_today() -> date:
-    return datetime.now(timezone.utc).date()
+def beijing_today() -> date:
+    return datetime.now(BEIJING_TIMEZONE).date()
+
+
+class BeijingFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        timestamp = datetime.fromtimestamp(record.created, BEIJING_TIMEZONE)
+        return timestamp.strftime(datefmt) if datefmt else timestamp.isoformat(timespec="milliseconds")
 
 
 class DailyLogHandler(logging.FileHandler):
@@ -23,7 +30,7 @@ class DailyLogHandler(logging.FileHandler):
         self.directory = directory.resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.retention_days = retention_days
-        self.day = utc_today()
+        self.day = beijing_today()
         self._prune(self.day)
         super().__init__(self.directory / f"pipeline-{self.day}.log", encoding="utf-8")
 
@@ -48,7 +55,7 @@ class DailyLogHandler(logging.FileHandler):
         try:
             if self._closed:
                 return 0
-            today = utc_today()
+            today = beijing_today()
             if today != self.day:
                 if self.stream:
                     self.stream.close()
@@ -63,7 +70,7 @@ class DailyLogHandler(logging.FileHandler):
         if self._closed:
             return
         try:
-            if utc_today() != self.day:
+            if beijing_today() != self.day:
                 self.maintain()
             super().emit(record)
         except Exception:
@@ -86,10 +93,7 @@ class AccessLogFilter(logging.Filter):
 def configured_logging(settings: Settings):
     file_handler = DailyLogHandler(settings.pipeline_log_dir, settings.log_retention_days)
     console_handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "%(asctime)s.%(msecs)03dZ %(levelname)s %(name)s %(message)s", "%Y-%m-%dT%H:%M:%S",
-    )
-    formatter.converter = time.gmtime
+    formatter = BeijingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     for handler in (file_handler, console_handler):
         handler.setFormatter(formatter)
         handler.addFilter(AccessLogFilter())
