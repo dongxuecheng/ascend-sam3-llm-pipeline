@@ -25,7 +25,7 @@
 | Docker Engine | 18.09 |
 | docker-compose | 1.22，使用带连字符的旧命令 |
 | Compose 文件格式 | 2.4，与 ascend-llm 一致 |
-| 基础镜像 | 与 ascend-sam3 相同的 CANN 9.0.0 / Ubuntu 22.04 / Python 3.11 镜像 |
+| 基础镜像 | python:3.11-slim-bookworm（Python 3.11 / Debian Bookworm） |
 | 网络 | Linux host 网络 |
 | NPU | 新服务不映射设备、不加载模型，不额外占用 NPU |
 | 服务进程 | 一个 API 进程，内部异步调度 |
@@ -33,8 +33,10 @@
 | 默认 SAM3 地址 | http://127.0.0.1:18000/predict/file |
 | 默认 LLM 地址 | http://127.0.0.1:8080/v1 |
 
-默认复用现有 SAM3 的基础镜像，避免为旧 Docker 引入未经验证的新运行环境。
-虽然镜像含有 CANN，本服务只使用 Python、HTTP 和 Pillow，不访问驱动。
+默认使用普通 Python 镜像。本服务通过 HTTP 调用已有 SAM3 / LLM 服务，
+只使用 Python、HTTP 和 Pillow，不依赖 CANN、NPU 驱动或模型推理框架。
+Docker / Compose 的版本保持不变，不要求与模型服务使用相同的基础镜像。
+该基础镜像仍需在目标服务器的 Docker 18.09 环境验证构建和运行兼容性。
 
 Dockerfile 不使用 BuildKit 的 RUN --mount、COPY --link 等功能。
 Compose 不使用 profiles、宿主机 host-gateway、服务扩容或带默认值的变量插值。
@@ -57,6 +59,8 @@ mkdir -p data/events
 
 编辑 .env：
 
+- PIPELINE_BASE_IMAGE 默认为 python:3.11-slim-bookworm。若此前已经创建 .env，
+  请同步修改该值；cp -n 不会覆盖已有配置，Compose 会用它覆盖 Dockerfile 的默认值。
 - 两个模型服务地址通常不需要修改。
 - LLM_MODEL 留空时，第一次候选图片会读取 /v1/models；必须只返回一个模型。
   也可以填写当前服务的 served-model-name。

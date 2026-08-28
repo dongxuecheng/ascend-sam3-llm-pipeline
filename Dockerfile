@@ -1,6 +1,6 @@
 # Legacy builder compatible: Docker 18.09 / docker-compose 1.22.
-# Reuse ascend-sam3's Python 3.11 base image; no NPU device is needed.
-ARG BASE_IMAGE=swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-310p-ubuntu22.04-py3.11
+# CPU-only HTTP orchestration and image processing; no CANN/NPU runtime is needed.
+ARG BASE_IMAGE=python:3.11-slim-bookworm
 FROM ${BASE_IMAGE}
 
 ARG PIP_INDEX_URL=https://pypi.org/simple
