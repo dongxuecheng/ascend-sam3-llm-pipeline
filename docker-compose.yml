@@ -1,0 +1,42 @@
+version: "2.4"
+
+# Legacy Compose format, matching ascend-llm. No BuildKit/Compose V2 features.
+services:
+  pipeline:
+    image: sam3-llm-pipeline:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: "${PIPELINE_BASE_IMAGE}"
+        PIP_INDEX_URL: "${PIP_INDEX_URL}"
+    container_name: sam3-llm-pipeline
+    restart: unless-stopped
+    # ascend-llm listens on the server's 127.0.0.1:8080.
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      PIPELINE_DATA_DIR: /data/events
+    volumes:
+      - "${PIPELINE_STORAGE_DIR}:/data/events"
+    stop_grace_period: 60s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PIPELINE_PORT', '18080') + '/health', timeout=5)
+      interval: 15s
+      timeout: 8s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
