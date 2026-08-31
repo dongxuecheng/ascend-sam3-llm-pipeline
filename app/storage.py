@@ -21,7 +21,9 @@ from app.time_utils import as_beijing, as_utc, utc_now
 
 
 _DAY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
-_EVENT_PATTERN = re.compile(r"\d{6}_\d{6}_[0-9a-f]{32}")
+_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_EVENT_PATTERN = re.compile(r"\d{2}-\d{2}-\d{2}\.\d{6}(?:-\d{2})?")
+_LEGACY_EVENT_PATTERN = re.compile(r"\d{6}_\d{6}_[0-9a-f]{32}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,17 +180,30 @@ class EvidenceStore:
         if not reply.verdict.confirmed:
             raise ValueError("Only confirmed frames may be saved")
         frame = candidate.frame
+        if (not _IDENTIFIER_PATTERN.fullmatch(frame.machine_id)
+                or not _IDENTIFIER_PATTERN.fullmatch(frame.stream_id)):
+            raise ValueError("Machine and stream identifiers are not safe path names")
         confirmed_at = utc_now()
         confirmed_beijing = as_beijing(confirmed_at)
         parent = (self.root / confirmed_beijing.strftime("%Y-%m-%d") /
-                  f"machine_{frame.machine_id}" / f"stream_{frame.stream_id}")
+                  frame.machine_id / frame.stream_id)
         if not parent.resolve().is_relative_to(self.root):
             raise ValueError("Evidence directory must stay inside the data directory")
         parent.mkdir(parents=True, exist_ok=True)
-        name = confirmed_beijing.strftime("%H%M%S_%f") + "_" + uuid4().hex
-        target = parent / name
-        staging = parent / (".tmp-" + name)
-        staging.mkdir()
+        name = confirmed_beijing.strftime("%H-%M-%S.%f")
+        for sequence in range(100):
+            event_name = name if sequence == 0 else f"{name}-{sequence:02d}"
+            target = parent / event_name
+            staging = parent / (".tmp-" + event_name)
+            if target.exists():
+                continue
+            try:
+                staging.mkdir()
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise FileExistsError("Could not allocate a unique evidence directory")
         original_name = "original" + frame.image.original_extension
         try:
             self._write(staging / original_name, frame.image.original)
@@ -285,15 +300,23 @@ class EvidenceStore:
                 event_day = date.fromisoformat(day_entry.name)
             except ValueError:
                 continue
-            for machine in self._directories(Path(day_entry.path), prefix="machine_"):
-                for stream in self._directories(machine, prefix="stream_"):
+            for machine in self._identifier_directories(
+                Path(day_entry.path), legacy_prefix="machine_",
+            ):
+                for stream in self._identifier_directories(
+                    machine, legacy_prefix="stream_",
+                ):
                     for entry in self._entries(stream):
                         if not entry.is_dir(follow_symlinks=False):
                             continue
                         path = Path(entry.path)
                         if entry.name.startswith(".tmp-"):
                             temporary.append(path)
-                        elif _EVENT_PATTERN.fullmatch(entry.name) and self._is_final_event(path):
+                        elif (
+                            (_EVENT_PATTERN.fullmatch(entry.name)
+                             or _LEGACY_EVENT_PATTERN.fullmatch(entry.name))
+                            and self._is_final_event(path)
+                        ):
                             finalized.append((event_day, path))
                         for child in self._entries(path):
                             if (child.is_file(follow_symlinks=False)
@@ -310,10 +333,19 @@ class EvidenceStore:
         except OSError:
             return []
 
-    def _directories(self, path: Path, *, prefix: str) -> list[Path]:
+    def _identifier_directories(
+        self, path: Path, *, legacy_prefix: str,
+    ) -> list[Path]:
+        def owned(name: str) -> bool:
+            return bool(
+                _IDENTIFIER_PATTERN.fullmatch(name)
+                or (name.startswith(legacy_prefix)
+                    and _IDENTIFIER_PATTERN.fullmatch(name[len(legacy_prefix):]))
+            )
+
         return [
             Path(entry.path) for entry in self._entries(path)
-            if entry.name.startswith(prefix) and entry.is_dir(follow_symlinks=False)
+            if owned(entry.name) and entry.is_dir(follow_symlinks=False)
         ]
 
     @staticmethod

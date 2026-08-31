@@ -245,15 +245,17 @@ data/events/
   .state/
     alarm-dedup.sqlite3
   2026-08-28/
-    machine_frontend-1/
-      stream_camera-01/
-        020000_123456_随机标识/
+    frontend-1/
+      camera-01/
+        14-26-08.028000/
           original.jpg
           annotated.jpg
           metadata.json
 ~~~
 
-原图文件扩展名按实际格式确定，不依赖上传文件名。
+目录依次为北京时间日期、machine_id、stream_id 和精确到微秒的报警确认时间。
+同一微秒发生重名时自动追加两位序号；不再添加 machine_、stream_ 和随机 UUID。
+原图文件扩展名按实际格式确定，不依赖上传文件名。旧版目录不会自动迁移，但仍会被保留期和磁盘水位清理识别。
 
 - original：保留上传字节，不覆盖、不画框。
 - annotated.jpg：在原图副本上绘制 SAM3 框、类别和分数；fire 为红色，

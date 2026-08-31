@@ -23,6 +23,7 @@ from app.config import DEFAULT_LLM_SYSTEM_PROMPT, DEFAULT_LLM_USER_PROMPT, Setti
 from app.dedup import AlarmDeduplicator, LLMStreamGate
 from app.domain import Candidate, Frame, LLMReply, LLMVerdict, PROMPT_VERSION
 from app.storage import EvidenceStore
+from app.time_utils import as_beijing
 from app.images import ImageTooLarge, InvalidImage, prepare_image
 from app.main import create_app
 
@@ -141,6 +142,15 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.wait_for(app.state.pipeline.drain(), 3)
                         alarm.assert_awaited_once()
                         event = alarm.await_args.args[0]
+                        relative = event.directory.relative_to(self.root)
+                        self.assertEqual(len(relative.parts), 4)
+                        self.assertRegex(relative.parts[0], r"^\d{4}-\d{2}-\d{2}$")
+                        self.assertEqual(relative.parts[1], "machine-1")
+                        self.assertEqual(relative.parts[2], "stream_1")
+                        self.assertRegex(
+                            relative.parts[3],
+                            r"^\d{2}-\d{2}-\d{2}\.\d{6}(?:-\d{2})?$",
+                        )
                         self.assertEqual(event.original.read_bytes(), self.data)
                         metadata = json.loads(event.metadata.read_text(encoding="utf-8"))
                         self.assertEqual(metadata["llm"]["result"], result)
@@ -732,6 +742,15 @@ class ValidationTests(unittest.TestCase):
                 expired = store.save(candidate, result, 1.0)
             with patch("app.storage.utc_now", return_value=now):
                 current = store.save(candidate, result, 1.0)
+            legacy = (
+                root / (as_beijing(now - timedelta(days=3)).strftime("%Y-%m-%d"))
+                / "machine_legacy" / "stream_legacy"
+                / ("010203_123456_" + "a" * 32)
+            )
+            legacy.mkdir(parents=True)
+            (legacy / "original.png").write_bytes(b"old")
+            (legacy / "annotated.jpg").write_bytes(b"old")
+            (legacy / "metadata.json").write_text("{}", encoding="utf-8")
             abandoned = current.directory.parent / ".tmp-abandoned"
             abandoned.mkdir()
             os.utime(abandoned, (time.time() - 10, time.time() - 10))
@@ -741,10 +760,11 @@ class ValidationTests(unittest.TestCase):
 
             report = store.maintain()
             self.assertFalse(expired.directory.exists())
+            self.assertFalse(legacy.exists())
             self.assertTrue(current.directory.exists())
             self.assertFalse(abandoned.exists())
             self.assertEqual(state_file.read_bytes(), b"state")
-            self.assertEqual(report.expired_events_removed, 1)
+            self.assertEqual(report.expired_events_removed, 2)
             self.assertEqual(report.temporary_paths_removed, 1)
 
     def test_evidence_pressure_cleanup_stops_at_target_watermark(self):
