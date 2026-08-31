@@ -40,7 +40,9 @@ class Settings(BaseModel):
     llm_system_prompt: str = DEFAULT_LLM_SYSTEM_PROMPT
     llm_user_prompt: str = DEFAULT_LLM_USER_PROMPT
     sam3_concurrency: int = Field(default=4, ge=1, le=32)
-    llm_concurrency: int = Field(default=2, ge=1, le=32)
+    llm_concurrency: int = Field(default=1, ge=1, le=32)
+    llm_stream_cooldown_seconds: FiniteFloat = Field(default=30.0, ge=0, le=86400)
+    alarm_stream_cooldown_seconds: FiniteFloat = Field(default=300.0, ge=0, le=86400)
     sam3_queue_size: int = Field(default=15, ge=1, le=1000)
     llm_queue_size: int = Field(default=15, ge=1, le=1000)
     sam3_timeout_seconds: FiniteFloat = Field(default=15.0, gt=0)

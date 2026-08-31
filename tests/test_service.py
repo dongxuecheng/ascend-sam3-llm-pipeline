@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from app.clients import parse_detections
 from app.config import DEFAULT_LLM_SYSTEM_PROMPT, DEFAULT_LLM_USER_PROMPT, Settings
+from app.dedup import LLMStreamGate
 from app.domain import Candidate, Frame, LLMReply, LLMVerdict, PROMPT_VERSION
 from app.storage import EvidenceStore
 from app.images import ImageTooLarge, InvalidImage, prepare_image
@@ -96,6 +97,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             "sam3_timeout_seconds": 3,
             "llm_timeout_seconds": 3,
             "shutdown_timeout_seconds": 0.3,
+            # Individual tests opt into the production time window when relevant.
+            "llm_stream_cooldown_seconds": 0,
         }
         config.update(overrides)
         app = create_app(Settings(**config), transport=httpx.MockTransport(handler or Stub()))
@@ -334,7 +337,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_auto_model_discovery_is_cached(self):
         stub = Stub(llm_result="none")
         async with self.running(stub, llm_model="") as (app, client):
-            await asyncio.gather(*(self.upload(client) for _ in range(4)))
+            await asyncio.gather(*(
+                self.upload(client, fields={"stream_id": f"stream_{index}"})
+                for index in range(4)
+            ))
             await app.state.pipeline.drain()
             self.assertEqual(sum(r.url.path == "/v1/models" for r in stub.requests), 1)
             self.assertEqual(sum(r.url.path == "/v1/chat/completions" for r in stub.requests), 4)
@@ -376,7 +382,49 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
             await app.state.pipeline.drain()
 
-    async def test_llm_backpressure_bounds_both_queues_without_dropping_candidates(self):
+    async def test_stream_single_flight_and_cooldown_suppress_before_llm_queue(self):
+        llm_entered, release = asyncio.Event(), asyncio.Event()
+        llm_calls = 0
+
+        async def handler(request):
+            nonlocal llm_calls
+            if request.url.path == "/predict/file":
+                return httpx.Response(200, json={"results": BOXES})
+            llm_calls += 1
+            if llm_calls == 1:
+                llm_entered.set()
+                await release.wait()
+            return reply("none")
+
+        async with self.running(
+            handler, llm_concurrency=1, llm_stream_cooldown_seconds=3600,
+        ) as (app, client):
+            pipeline = app.state.pipeline
+            self.assertEqual((await self.upload(client)).status_code, 202)
+            await llm_entered.wait()
+
+            # Same stream is suppressed while its first candidate is running.
+            self.assertEqual((await self.upload(client)).status_code, 202)
+            await until(lambda: pipeline.counts["llm_suppressed_stream_inflight"] == 1)
+
+            # A distinct stream remains independent and may queue normally.
+            self.assertEqual((await self.upload(
+                client, fields={"stream_id": "stream_2"},
+            )).status_code, 202)
+            await until(lambda: pipeline.llm_queue.qsize() == 1)
+            release.set()
+            await pipeline.drain()
+            self.assertEqual(llm_calls, 2)
+
+            # Skipped frames do not move the window; the admitted timestamp still applies.
+            self.assertEqual((await self.upload(client)).status_code, 202)
+            await pipeline.drain()
+            self.assertEqual(llm_calls, 2)
+            self.assertEqual(pipeline.counts["llm_suppressed_cooldown"], 1)
+            self.assertEqual(pipeline.counts["sam3_candidates"], 4)
+            self.assertEqual(pipeline.counts["llm_enqueued"], 2)
+
+    async def test_llm_backpressure_bounds_both_queues_without_dropping_distinct_streams(self):
         entered, release = asyncio.Event(), asyncio.Event()
         sam_calls = 0
 
@@ -392,15 +440,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         async with self.running(handler, sam3_concurrency=1, llm_concurrency=1,
                                 sam3_queue_size=1, llm_queue_size=1) as (app, client):
             pipeline = app.state.pipeline
+
+            async def upload_stream(index):
+                return await self.upload(client, fields={"stream_id": f"stream_{index}"})
+
             try:
-                await self.upload(client)
+                await upload_stream(1)
                 await entered.wait()
-                await self.upload(client)
+                await upload_stream(2)
                 await until(lambda: pipeline.llm_queue.full())
-                await self.upload(client)
+                await upload_stream(3)
                 await until(lambda: sam_calls == 3)
-                await self.upload(client)
-                self.assertEqual((await self.upload(client)).status_code, 429)
+                await upload_stream(4)
+                self.assertEqual((await upload_stream(5)).status_code, 429)
                 self.assertEqual(pipeline.sam3_queue.qsize(), 1)
                 self.assertEqual(pipeline.llm_queue.qsize(), 1)
             finally:
@@ -425,7 +477,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.running(handler, sam3_concurrency=2, llm_concurrency=2) as (app, client):
             try:
-                responses = await asyncio.gather(*(self.upload(client) for _ in range(6)))
+                responses = await asyncio.gather(*(
+                    self.upload(client, fields={"stream_id": f"stream_{index}"})
+                    for index in range(6)
+                ))
                 self.assertTrue(all(r.status_code == 202 for r in responses))
                 await until(lambda: active["sam"] == 2)
                 gates["sam"].set()
@@ -436,6 +491,29 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                     gate.set()
             await app.state.pipeline.drain()
             self.assertEqual(app.state.pipeline.counts["llm_none"], 6)
+
+    async def test_alarm_dedup_persists_and_new_hazard_bypasses_cooldown(self):
+        cases = [
+            ("fire", 1, "sent"),
+            ("fire", 0, "suppressed_duplicate"),
+            ("smoke", 1, "sent"),
+            ("fire_smoke", 0, "suppressed_duplicate"),
+        ]
+        for result, expected_calls, expected_status in cases:
+            before = set(self.root.rglob("metadata.json"))
+            with patch("app.alarm.send_alarm", new=AsyncMock(return_value=True)) as sender:
+                async with self.running(
+                    Stub(llm_result=result), llm_stream_cooldown_seconds=0,
+                    alarm_stream_cooldown_seconds=300,
+                ) as (app, client):
+                    self.assertEqual((await self.upload(client)).status_code, 202)
+                    await app.state.pipeline.drain()
+                    self.assertEqual(sender.await_count, expected_calls)
+            created = set(self.root.rglob("metadata.json")) - before
+            self.assertEqual(len(created), 1)
+            metadata = json.loads(created.pop().read_text(encoding="utf-8"))
+            self.assertEqual(metadata["alarm"]["status"], expected_status)
+        self.assertTrue((self.root / ".state" / "alarm-dedup.sqlite3").is_file())
 
     async def test_save_failure_does_not_invoke_alarm_and_worker_survives(self):
         with patch("app.alarm.send_alarm", new=AsyncMock()) as alarm:
@@ -449,13 +527,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.state.pipeline.counts["save_failed"], 1)
                 alarm.assert_awaited_once()
 
-    async def test_alarm_failure_keeps_saved_evidence(self):
-        with patch("app.alarm.send_alarm", new=AsyncMock(side_effect=OSError("unavailable"))):
-            async with self.running() as (app, client):
+    async def test_alarm_failure_is_not_deduplicated_and_keeps_saved_evidence(self):
+        sender = AsyncMock(side_effect=[OSError("unavailable"), True])
+        with patch("app.alarm.send_alarm", new=sender):
+            async with self.running(
+                llm_stream_cooldown_seconds=0, alarm_stream_cooldown_seconds=300,
+            ) as (app, client):
                 await self.upload(client)
                 await app.state.pipeline.drain()
+                await self.upload(client)
+                await app.state.pipeline.drain()
+                self.assertEqual(sender.await_count, 2)
                 self.assertEqual(app.state.pipeline.counts["alarm_failed"], 1)
-                self.assertEqual(len(list(self.root.rglob("metadata.json"))), 1)
+                self.assertEqual(app.state.pipeline.counts["alarm_sent"], 1)
+                metadata = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in self.root.rglob("metadata.json")
+                ]
+                self.assertEqual({item["alarm"]["status"] for item in metadata}, {"failed", "sent"})
 
     async def test_invalid_uploads_and_identifiers_never_reach_models(self):
         stub = Stub()
@@ -512,6 +601,20 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_stream_gate_uses_fixed_window_without_extending_on_skips(self):
+        clock = iter((100.0, 110.0, 130.0, 130.0))
+        gate = LLMStreamGate(30, clock=lambda: next(clock))
+        self.assertTrue(gate.admit("machine-1", "stream-1").admitted)
+        self.assertEqual(gate.admit("machine-1", "stream-1").reason, "stream_inflight")
+        gate.release("machine-1", "stream-1")
+
+        skipped = gate.admit("machine-1", "stream-1")
+        self.assertFalse(skipped.admitted)
+        self.assertEqual(skipped.reason, "cooldown")
+        self.assertEqual(skipped.remaining_seconds, 20)
+        self.assertTrue(gate.admit("machine-2", "stream-1").admitted)
+        self.assertTrue(gate.admit("machine-1", "stream-1").admitted)
+
     def test_partial_evidence_is_cleaned_when_annotation_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             store = EvidenceStore(Path(directory))
@@ -586,6 +689,8 @@ class ValidationTests(unittest.TestCase):
 
     def test_unbounded_queue_or_nonfinite_timeout_cannot_be_configured(self):
         for setting in ({"sam3_queue_size": 0}, {"llm_concurrency": 0},
+                        {"llm_stream_cooldown_seconds": -1},
+                        {"alarm_stream_cooldown_seconds": float("inf")},
                         {"llm_timeout_seconds": float("inf")}, {"sam3_url": "not a URL"},
                         {"log_retention_days": 0}, {"log_retention_days": 31}, {"log_level": "INVALID"}):
             with self.subTest(setting=setting), self.assertRaises(ValidationError):

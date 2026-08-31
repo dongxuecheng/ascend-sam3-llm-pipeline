@@ -93,6 +93,24 @@ class EvidenceStore:
             raise
         return SavedEvent(target, target / original_name, target / "annotated.jpg", target / "metadata.json")
 
+    def update_alarm(self, event: SavedEvent, status: dict) -> None:
+        target = event.metadata
+        if (target.name != "metadata.json" or target.is_symlink()
+                or not target.resolve().is_relative_to(self.root)):
+            raise ValueError("Alarm metadata must stay inside the data directory")
+        metadata = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            raise ValueError("Evidence metadata must be a JSON object")
+        metadata["alarm"] = status
+        temporary = target.with_name(".tmp-alarm-" + uuid4().hex + ".json")
+        try:
+            self._write(temporary, (
+                json.dumps(metadata, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+            ).encode("utf-8"))
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     @staticmethod
     def _write(path: Path, content: bytes) -> None:
         with path.open("xb") as output:

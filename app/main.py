@@ -14,6 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.clients import LLMClient, Sam3Client
 from app.config import Settings
+from app.dedup import AlarmDeduplicator
 from app.domain import Frame
 from app.images import ImageTooLarge, InvalidImage, prepare_image
 from app.pipeline import Pipeline
@@ -72,12 +73,19 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
     async def lifespan(application: FastAPI):
         store = EvidenceStore(settings.pipeline_data_dir, settings=settings)
         await asyncio.to_thread(store.initialize)
+        alarm_deduplicator = AlarmDeduplicator(
+            store.root, settings.alarm_stream_cooldown_seconds,
+        )
+        await asyncio.to_thread(alarm_deduplicator.initialize)
         connections = settings.sam3_concurrency + settings.llm_concurrency + 2
         async with httpx.AsyncClient(
             transport=transport, trust_env=False, follow_redirects=False,
             limits=httpx.Limits(max_connections=connections, max_keepalive_connections=connections),
         ) as http:
-            pipeline = Pipeline(settings, Sam3Client(http, settings), LLMClient(http, settings), store)
+            pipeline = Pipeline(
+                settings, Sam3Client(http, settings), LLMClient(http, settings),
+                store, alarm_deduplicator,
+            )
             application.state.pipeline = pipeline
             pipeline.start()
             try:

@@ -79,6 +79,7 @@ def main():
         "SAM3_URL", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "CORS_ORIGINS",
         "SAM3_CLASS_NAMES", "LLM_SYSTEM_PROMPT", "LLM_USER_PROMPT",
         "PIPELINE_LOG_DIR", "LOG_LEVEL", "LOG_RETENTION_DAYS",
+        "LLM_STREAM_COOLDOWN_SECONDS", "ALARM_STREAM_COOLDOWN_SECONDS",
     }}
     env.update({
         "PIPELINE_HOST": "127.0.0.1", "PIPELINE_PORT": str(api_port),
@@ -87,7 +88,8 @@ def main():
         "SAM3_URL": f"http://127.0.0.1:{model_port}/predict/file",
         "LLM_BASE_URL": f"http://127.0.0.1:{model_port}/v1",
         "LLM_MODEL": "", "LLM_API_KEY": "", "CORS_ORIGINS": "",
-        "SAM3_CONCURRENCY": "4", "LLM_CONCURRENCY": "2",
+        "SAM3_CONCURRENCY": "4", "LLM_CONCURRENCY": "1",
+        "LLM_STREAM_COOLDOWN_SECONDS": "30", "ALARM_STREAM_COOLDOWN_SECONDS": "300",
         "SAM3_QUEUE_SIZE": "15", "LLM_QUEUE_SIZE": "15",
         "SHUTDOWN_TIMEOUT_SECONDS": "2", "PYTHONUNBUFFERED": "1",
     })
@@ -133,6 +135,7 @@ def main():
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"Did not save all frames: {health}")
                     time.sleep(0.05)
+                assert (output / "events" / ".state" / "alarm-dedup.sqlite3").is_file()
                 metadata_files = list((output / "events").rglob("metadata.json"))
                 assert len(metadata_files) == 15
                 for metadata_file in metadata_files:

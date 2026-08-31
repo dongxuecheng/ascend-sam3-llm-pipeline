@@ -8,13 +8,14 @@
 
 1. POST /v1/frames 接收一张图片，入队后立即返回 202。
 2. SAM3 使用配置的检测词（默认 fire、smoke）推理，不返回 mask。
-3. 任一检测框分数严格大于 0.3 时，对同一张图片执行一次 LLM 检测。
-4. LLM 明确确认火焰或烟雾时，保存原图、SAM3 标注图和 JSON 元数据。
-5. 保存完成后调用报警占位函数；目前不会发送任何外部报警。
-6. 未检出、不确定、模型请求失败、超时或回复解析失败，直接跳过图片，不重试、不重新采样。
+3. 任一检测框分数严格大于 0.3 时，按设备和视频流执行冷却及单任务准入。
+4. 通过准入的图片执行一次 LLM 检测；冷却中或已有同流任务时在入队前跳过。
+5. LLM 明确确认火焰或烟雾时，保存原图、SAM3 标注图和 JSON 元数据。
+6. 保存完成后执行报警去重并调用报警占位函数；目前不会发送任何外部报警。
+7. 未检出、不确定、模型请求失败、超时或回复解析失败，直接跳过图片，不重试、不重新采样。
 
-没有任务 ID、任务查询接口、数据库、Redis、事件合并或告警冷却。
-每张确认图片独立保存；同一视频流持续出现火焰时，会产生多份证据。
+没有任务 ID、任务查询接口或 Redis。SQLite 只保存成功报警的去重状态，不保存图片任务。
+每张确认图片独立保存；同一视频流持续出现火焰时仍可产生多份证据，但 LLM 和报警频率受独立冷却参数控制。
 
 ## 部署环境
 
@@ -161,7 +162,7 @@ Content-Type / boundary，由 curl、浏览器 FormData 或 HTTP 客户端生成
   "status": "ok",
   "upstreams": "not_checked",
   "queues": {"sam3": 0, "llm": 0},
-  "counts": {"accepted": 10, "sam3_candidates": 2, "saved": 1, "llm_uncertain": 1}
+  "counts": {"accepted": 10, "sam3_candidates": 4, "llm_enqueued": 2, "llm_suppressed_cooldown": 2}
 }
 ~~~
 
@@ -173,12 +174,13 @@ Content-Type / boundary，由 curl、浏览器 FormData 或 HTTP 客户端生成
 两个有界 FIFO 队列：
 
 - SAM3_CONCURRENCY 个 SAM3 工作协程读取入口队列。
-- 标签匹配 SAM3_CLASS_NAMES（默认 fire/smoke）、score > 0.3 的候选进入 LLM 队列，一张图只提交一次。
-- LLM_CONCURRENCY 个工作协程独立完成 LLM 检测、证据保存和报警占位调用。
-- LLM 队列满时，SAM3 工作协程等待候选入队，不丢弃已识别的候选。
-  入口队列也满后，后续上传返回 429。
+- 标签匹配 SAM3_CLASS_NAMES（默认 fire/smoke）、score > 0.3 的图片先经过流级准入，再决定是否进入 LLM 队列。
+- 同一个 machine_id + stream_id 最多有一张图片等待或执行 LLM；已有任务时，新候选在进入 LLM 队列前跳过。
+- 距该流上次准入不足 LLM_STREAM_COOLDOWN_SECONDS 时跳过；跳过不更新时间，不会因持续上传而无限延长窗口。
+- 不同机器或不同视频流互不影响。LLM_CONCURRENCY 个工作协程处理已准入的候选。
+- LLM 队列满时，SAM3 工作协程等待不同流的候选入队；入口队列也满后，后续上传返回 429。
 - SAM3 和 LLM 每张图片都只尝试一次；HTTP 客户端不开自动重试。
-- 不合并同一路视频的图片，不保存普通阴性帧或不确定帧。
+- 冷却、执行中、普通阴性或不确定图片不保存；每张经 LLM 确认的图片仍独立保存。
 
 LLM 使用当前 ascend-llm 的 /chat/completions 接口，关闭思考模式，
 temperature=0，输出限制默认 128 tokens。输出需要是严格 JSON：
@@ -232,7 +234,7 @@ docker-compose up -d --no-build --force-recreate pipeline
 - 必须使用一个 API 进程。不要增加 Uvicorn workers 或复制多个服务实例，
   否则全局队列和并发上限会被放大。
 - 队列吸收突发，不能解决长期过载。队列太大会使旧图片等待很久。
-- 内存队列不持久化，重启、崩溃或关机超时都会丢失未完成图片。
+- 内存队列和 LLM 流级冷却不持久化，重启、崩溃或关机超时都会丢失未完成图片；成功报警去重状态会持久化。
 - 已有 SAM3 某些底层失败可能以空 results 返回；本服务无法仅凭该响应
   区分故障与未检出。这里没有修改 ascend-sam3 的错误协议。
 - LLM 不确定或失败直接跳过，可能漏报；这是当前明确选择的处理方式。
@@ -241,6 +243,8 @@ docker-compose up -d --no-build --force-recreate pipeline
 
 ~~~text
 data/events/
+  .state/
+    alarm-dedup.sqlite3
   2026-08-28/
     machine_frontend-1/
       stream_camera-01/
@@ -301,14 +305,21 @@ docker-compose stop pipeline
 docker-compose run --rm --no-deps pipeline
 ~~~
 
-## 报警对接位置
+## 报警对接位置和去重
 
-app/alarm.py 中的 send_alarm(event) 是唯一对接位置。
-event 提供原图、标注图和 JSON 元数据路径，后续在这里实现上传协议。
+app/alarm.py 中的 send_alarm(event) 是唯一对接位置，event 提供原图、标注图和 JSON 元数据路径。
+当前函数只打印 alarm_not_configured、不发 HTTP 请求并返回 False，因此不会被误记为已发送。
+后续实现上传协议时，只有对端明确确认成功后才返回 True；失败应抛出异常。
 
-当前函数只打印 alarm_not_configured，不发 HTTP 请求。
-metadata.json 也明确记录 alarm.status=not_configured。
-没有报警重试或去重；后续实现报警协议时需要同步定义投递状态的记录方式。
+成功报警按 machine_id + stream_id 去重，默认 300 秒内不重复上传相同危险。
+若窗口内出现之前未报警的新危险类型则立即上传，例如 fire 后出现 smoke，或 fire 后变为 fire_smoke。
+相同流的报警正在发送时也不会并发重复发送。确认图片始终先保存，重复报警只跳过接口调用，
+metadata.json 分别记录 sent、suppressed_duplicate、failed 或 not_configured。
+
+成功报警状态保存在 PIPELINE_DATA_DIR/.state/alarm-dedup.sqlite3，
+位于现有 /data/events 持久化挂载中，容器重建后仍有效。失败投递不会写入去重状态；
+同一张图片不重试，但未来的新确认事件可以再次尝试。当前仅支持一个 API 进程，
+多个服务副本不能依赖这个本地状态实现跨副本互斥。
 
 ## 可调整参数
 
@@ -320,7 +331,9 @@ metadata.json 也明确记录 alarm.status=not_configured。
 | LOG_LEVEL | INFO | 日志级别：DEBUG / INFO / WARNING / ERROR / CRITICAL |
 | LOG_RETENTION_DAYS | 30 | 日志保留的北京时间日期数，含当天，范围 1–30 |
 | SAM3_CONCURRENCY | 4 | 访问 SAM3 的并发上限 |
-| LLM_CONCURRENCY | 2 | LLM 阶段工作协程数量，范围 1–32，不等于 NPU 设备数 |
+| LLM_CONCURRENCY | 1 | LLM 阶段工作协程数量，范围 1–32，不等于 NPU 设备数 |
+| LLM_STREAM_COOLDOWN_SECONDS | 30 | 同流两次进入 LLM 的最小间隔，范围 0–86400 秒；0 只关闭时间窗口 |
+| ALARM_STREAM_COOLDOWN_SECONDS | 300 | 同流成功报警去重窗口，范围 0–86400 秒；0 关闭时间窗口 |
 | SAM3_QUEUE_SIZE | 15 | 等待 SAM3 的图片数上限 |
 | LLM_QUEUE_SIZE | 15 | 等待 LLM 的候选数上限 |
 | SAM3_TIMEOUT_SECONDS | 15 | 每张图片 SAM3 请求的总期限 |
