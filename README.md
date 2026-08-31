@@ -11,7 +11,7 @@
 3. 任一检测框分数严格大于 0.3 时，按设备和视频流执行冷却及单任务准入。
 4. 通过准入的图片执行一次 LLM 检测；冷却中或已有同流任务时在入队前跳过。
 5. LLM 明确确认火焰或烟雾时，保存原图、SAM3 标注图和 JSON 元数据。
-6. 保存完成后执行报警去重并调用报警占位函数；目前不会发送任何外部报警。
+6. 执行报警去重并调用报警占位函数；若证据保存突然失败，仍使用内存内容尝试报警。当前不会发送外部报警。
 7. 未检出、不确定、模型请求失败、超时或回复解析失败，直接跳过图片，不重试、不重新采样。
 
 没有任务 ID、任务查询接口或 Redis。SQLite 只保存成功报警的去重状态，不保存图片任务。
@@ -69,7 +69,8 @@ mkdir -p data/events data/logs
 - 如果从浏览器跨域上传，填写 CORS_ORIGINS，包含协议、IP/域名和端口，
   三台机器对应的多个 origin 用逗号分隔。无需保证错峰。
 - 图片存储路径由 PIPELINE_STORAGE_DIR 指定，必须能被容器用户写入。
-  Compose 将其挂载为容器内的 /data/events。
+  Compose 将其挂载为容器内的 /data/events。客户现场建议填写机械硬盘上的绝对路径；
+  应通过宿主机启动顺序确保机械盘先挂载，本项目不校验机械盘挂载标识。
 - 无法访问 PyPI 时，可把 PIP_INDEX_URL 改成你信任的镜像地址。
 
 先确认已有两个模型服务可访问：
@@ -148,26 +149,24 @@ Content-Type / boundary，由 curl、浏览器 FormData 或 HTTP 客户端生成
 | 400 / 422 | 图片或参数无效 |
 | 413 | 上传字节数或图片像素数超限 |
 | 401 | 配置了上传密钥，但请求密钥错误 |
-| 503 | 正在停止、工作协程异常或 HTTP 连接并发超限 |
+| 503 | 正在停止、工作协程异常、SAM3/LLM 不可用、证据存储不可用或 HTTP 连接并发超限 |
 
 前端按自己设定的周期继续上传，不需要等待模型处理、不要求补发图片。
 服务不重新取帧、不安排复核、不假设前端能错峰。
 
-### GET /health
+### 健康和状态接口
 
-仅检查本服务工作协程，并返回队列长度和当前进程累计计数：
+- `GET /health/live`：只检查 API、工作协程和后台监控任务，Docker healthcheck 使用该接口。
+- `GET /health/ready`：检查本服务、SAM3、LLM 和证据存储；任一必要组件不可用时返回 503。
+- `GET /health`：兼容入口，语义与 `/health/ready` 相同。
+- `GET /status`：始终返回详细诊断快照，不用于 Docker 自动判活。
 
-~~~json
-{
-  "status": "ok",
-  "upstreams": "not_checked",
-  "queues": {"sam3": 0, "llm": 0},
-  "counts": {"accepted": 10, "sam3_candidates": 4, "llm_enqueued": 2, "llm_suppressed_cooldown": 2}
-}
-~~~
+状态快照包含程序版本、服务器 UTC/北京时间、两项上游最近探测结果、连续失败次数、
+证据盘容量和 inode、报警配置状态、队列和当前进程累计计数。后台探测结果会缓存，
+访问健康接口本身不会临时触发模型探测。计数在重启后归零，不是任务查询。
 
-不代表 SAM3 / LLM 已通过实际图片推理。计数在重启后归零，不是任务查询。
-未发生的计数字段可能不出现。启动不要求模型在线；下游故障时相应图片直接跳过。
+当 readiness 不通过时，`POST /v1/frames` 返回 503，不再先返回 202 后静默跳过。
+`ALARM_REQUIRED_FOR_READINESS` 默认关闭，因为当前报警实现仍是占位函数；正式对接报警后可开启。
 
 ## 推理和队列
 
@@ -261,12 +260,31 @@ data/events/
   smoke 为橙色，自定义标签为蓝色。绘制所有配置类别中通过 0.3 门槛的 SAM3 框，LLM 类别另记入 JSON。
 - metadata.json：机器/视频流信息、采集/接收/确认时间、图片尺寸、SAM3 框和
   置信度、实际检测词、LLM 结论和原始回复、模型名、完整提示词、提示词版本以及两阶段调用耗时。
-- 证据元数据中的服务器时间仍使用 UTC 并带时区；前端提供的采集时间保留其时区。
+- 证据目录使用北京时间日期和时间；元数据同时保存 UTC 与北京时间，前端采集时间保留原始时区。
+  当采集时间与服务器接收时间偏差超过 `MAX_CAPTURE_CLOCK_SKEW_SECONDS` 时只记录告警，不拒绝图片。
 - 对含 EXIF 旋转的图片，两个模型接收同一份方向归正的未标注图片；
   原始上传文件仍保持不变，标注图坐标按归正后的尺寸记录。
-- 一组文件先写入临时目录，全部成功后改为正式目录；不会在保存失败后调用报警。
-  硬中断可能留下 .tmp- 开头的不完整目录，它们不作为成功证据，也不自动恢复。
-- 磁盘容量、保留天数由部署方管理；本版不自动删除证据。
+- 一组文件先写入临时目录，全部成功后改为正式目录。硬中断遗留的 `.tmp-*` 和
+  `.tmp-alarm-*` 会按 `EVIDENCE_TMP_MAX_AGE_SECONDS` 定期清理。
+- 若保存时磁盘突然失败，仍使用内存中的原图、可生成的标注图和检测结论调用报警入口；
+  当前占位报警不会发出网络请求。
+
+## 证据保留和磁盘保护
+
+清理任务启动时执行一次，运行期间按 `EVIDENCE_CLEANUP_INTERVAL_SECONDS` 周期执行：
+
+1. 删除超过 `EVIDENCE_RETENTION_DAYS` 的完整证据事件。
+2. 清理超过临时文件最大年龄的项目临时目录和文件。
+3. 达到 `EVIDENCE_MAX_USAGE_PERCENT`、最低剩余字节或最低空闲 inode 阈值时，
+   从最旧事件开始删除，降到 `EVIDENCE_TARGET_USAGE_PERCENT` 后停止。
+
+清理只识别本项目的日期、机器、视频流和完整事件目录，不删除 `.state`、符号链接或未知路径。
+`EVIDENCE_CLEANUP_GRACE_SECONDS` 保护刚保存的事件，避免报警元数据仍在更新时被容量清理删除。
+若最低剩余字节大于整个文件系统容量，存储会报告配置错误且不会为了无法达到的目标删除全部证据。
+readiness 会持续检查可写性、容量和 inode；不满足阈值时新上传返回 503。
+
+建议证据目录独占机械硬盘分区。占用百分比统计的是整个文件系统，如果与其他业务共盘，
+其他文件可能导致清理任务删除更多历史证据。每次清理会记录删除类型、数量和释放字节数。
 
 ## 日志（最多 30 天）
 
@@ -275,7 +293,7 @@ data/events/
 不依赖宿主机或容器的时区设置，中文使用 UTF-8。
 日志时间格式示例：2026-08-28T17:00:57.084+08:00。
 已有日志不重写，升级后新增记录使用 +08:00；旧记录中的 Z 仍表示 UTC。
-本次时区调整不改变证据元数据中的时间格式。
+证据目录使用北京时间；元数据同时记录 UTC 和北京时间。
 
 - LOG_RETENTION_DAYS 默认 30，可设为 1–30；保留当天及之前 N-1 个北京时间日期的日志。
   启动立即清理过期文件，运行期间每 60 秒检查一次，即使没有上传也会清理。
@@ -283,43 +301,40 @@ data/events/
 - 只清理日志目录下命名为 pipeline-YYYY-MM-DD.log 的过期普通文件，
   不递归、不跟随符号链接，不删除 data/events 中的原图、标注图或元数据。
 - INFO 记录服务状态、HTTP 状态、SAM3 候选数、LLM 结论、耗时、保存路径和故障。
-  DEBUG 额外记录接收帧、队列长度和 SAM3 阴性结果。成功的 /health 访问不刷屏，失败仍记录。
+  DEBUG 额外记录接收帧、队列长度和 SAM3 阴性结果。成功的健康与状态接口访问不刷屏，失败仍记录。
   上游失败记录异常类型、HTTP 状态和耗时，不打印密钥、完整提示词、图片或模型原始回复。
   HTTP 访问日志去掉查询字符串，避免误记查询参数中的敏感信息。
 - 新增文件日志失败不会将已成功的推理改为失败；日志目录在启动时必须可写。
   保留天数不等于磁盘大小上限，仍需监测磁盘容量。
 
-为避免 Docker 另外保留超过 30 天的日志副本，Compose 使用 logging.driver: none。
-因此 docker-compose logs 不再提供日志；在服务器查看文件：
+应用文件日志仍是完整的 30 天记录。Compose 另外启用有界 `json-file` 日志，最多 3 个、每个 50 MiB，
+用于现场无法远程时通过 `docker-compose logs` 排查最近的启动和运行故障：
 
 ~~~bash
+docker-compose logs --tail 500 -f pipeline
 tail -n 100 -f "data/logs/pipeline-$(TZ=Asia/Shanghai date +%F).log"
 ~~~
 
-跨北京时间午夜后重新执行 tail 查看当天文件。仅修改 LOG_LEVEL / LOG_RETENTION_DAYS 后重建容器即可。
-升级日志实现需要构建新镜像并重建 pipeline 容器；仅 restart 不会加载镜像中的新代码。
-若启动失败且日志文件未生成，可在停止原容器后以前台方式查看启动错误：
-
-~~~bash
-docker-compose stop pipeline
-docker-compose run --rm --no-deps pipeline
-~~~
+跨北京时间午夜后重新执行 tail 查看当天文件。每分钟还会记录一次运行状态摘要，包含健康状态、
+磁盘、队列和计数。仅修改环境变量需要重建容器；升级代码需要重新构建镜像并重建容器。
 
 ## 报警对接位置和去重
 
-app/alarm.py 中的 send_alarm(event) 是唯一对接位置，event 提供原图、标注图和 JSON 元数据路径。
+app/alarm.py 中的 send_alarm(event) 是唯一对接位置。正常事件提供原图、标注图和 JSON 元数据路径；
+保存失败事件提供内存中的原图、可用的标注图和检测元数据。真实实现必须兼容这两种事件。
 当前函数只打印 alarm_not_configured、不发 HTTP 请求并返回 False，因此不会被误记为已发送。
 后续实现上传协议时，只有对端明确确认成功后才返回 True；失败应抛出异常。
 
 成功报警按 machine_id + stream_id 去重，默认 300 秒内不重复上传相同危险。
 若窗口内出现之前未报警的新危险类型则立即上传，例如 fire 后出现 smoke，或 fire 后变为 fire_smoke。
-相同流的报警正在发送时也不会并发重复发送。确认图片始终先保存，重复报警只跳过接口调用，
+相同流的报警正在发送时也不会并发重复发送。正常情况下先保存证据；保存失败仍尝试报警。重复报警只跳过接口调用，
 metadata.json 分别记录 sent、suppressed_duplicate、failed 或 not_configured。
 
 成功报警状态保存在 PIPELINE_DATA_DIR/.state/alarm-dedup.sqlite3，
 位于现有 /data/events 持久化挂载中，容器重建后仍有效。失败投递不会写入去重状态；
 同一张图片不重试，但未来的新确认事件可以再次尝试。当前仅支持一个 API 进程，
-多个服务副本不能依赖这个本地状态实现跨副本互斥。
+多个服务副本不能依赖这个本地状态实现跨副本互斥。旧状态按 ALARM_STATE_RETENTION_DAYS 清理；
+启动时检查 SQLite 完整性，损坏文件会隔离并重建。明显位于未来的时间记录会忽略，避免系统时间回拨导致长时间抑制报警。
 
 ## 可调整参数
 
@@ -342,6 +357,21 @@ metadata.json 分别记录 sent、suppressed_duplicate、failed 或 not_configur
 | SHUTDOWN_TIMEOUT_SECONDS | 30 | 停止时排空队列的最长等待 |
 | MAX_IMAGE_BYTES | 8388608 | 单张图片上传字节上限 |
 | MAX_IMAGE_PIXELS | 16000000 | 单张图片像素上限 |
+| EVIDENCE_RETENTION_DAYS | 30 | 完整证据保留的北京时间日期数，范围 1–3650 |
+| EVIDENCE_MAX_USAGE_PERCENT | 85 | 文件系统达到该占用率时触发容量清理 |
+| EVIDENCE_TARGET_USAGE_PERCENT | 80 | 容量清理停止水位，必须小于触发水位 |
+| EVIDENCE_MIN_FREE_BYTES | 107374182400 | 最低剩余字节，默认 100 GiB，部署前按机械盘容量调整 |
+| EVIDENCE_MIN_FREE_INODES_PERCENT | 10 | 最低空闲 inode 百分比；不支持 inode 的平台显示 null |
+| EVIDENCE_CLEANUP_INTERVAL_SECONDS | 600 | 证据维护周期 |
+| EVIDENCE_TMP_MAX_AGE_SECONDS | 3600 | 项目临时路径最大保留时间 |
+| EVIDENCE_CLEANUP_GRACE_SECONDS | 300 | 新事件容量清理保护时间 |
+| UPSTREAM_HEALTH_PROBES_ENABLED | true | 是否后台检查 SAM3 和 LLM readiness |
+| UPSTREAM_HEALTH_PROBE_INTERVAL_SECONDS | 30 | 上游探测周期 |
+| UPSTREAM_HEALTH_PROBE_TIMEOUT_SECONDS | 5 | 单次上游探测超时 |
+| STATUS_LOG_INTERVAL_SECONDS | 60 | 运行状态摘要日志周期 |
+| ALARM_REQUIRED_FOR_READINESS | false | 报警未配置时是否阻止接收；真实报警上线后建议 true |
+| MAX_CAPTURE_CLOCK_SKEW_SECONDS | 300 | 前端采集时间偏差告警阈值，不拒绝图片 |
+| ALARM_STATE_RETENTION_DAYS | 90 | 成功报警去重状态和损坏隔离文件保留上限 |
 
 上传完整 multipart 请求还允许额外 64 KiB 表单开销，超限请求会在表单解析前拒绝。
 HTTP 连接并发上限为 64，图片解码和存储在线程中执行，不阻塞异步推理。

@@ -3,21 +3,24 @@ import base64
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager, closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
 from PIL import Image
 from pydantic import ValidationError
 
+from app.alarm import UnsavedAlarmEvent
 from app.clients import parse_detections
 from app.config import DEFAULT_LLM_SYSTEM_PROMPT, DEFAULT_LLM_USER_PROMPT, Settings
-from app.dedup import LLMStreamGate
+from app.dedup import AlarmDeduplicator, LLMStreamGate
 from app.domain import Candidate, Frame, LLMReply, LLMVerdict, PROMPT_VERSION
 from app.storage import EvidenceStore
 from app.images import ImageTooLarge, InvalidImage, prepare_image
@@ -99,6 +102,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             "shutdown_timeout_seconds": 0.3,
             # Individual tests opt into the production time window when relevant.
             "llm_stream_cooldown_seconds": 0,
+            "upstream_health_probes_enabled": False,
+            "evidence_min_free_bytes": 0,
+            "evidence_max_usage_percent": 99,
+            "evidence_target_usage_percent": 98,
+            "max_capture_clock_skew_seconds": 1000000000,
         }
         config.update(overrides)
         app = create_app(Settings(**config), transport=httpx.MockTransport(handler or Stub()))
@@ -141,6 +149,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(metadata["sam3"]["class_names"], ["fire", "smoke"])
                         self.assertEqual(metadata["stream_name"], "摄像头一")
                         self.assertEqual(metadata["captured_at"], "2026-08-28T10:00:00+08:00")
+                        self.assertTrue(metadata["received_at"].endswith("+00:00"))
+                        self.assertTrue(metadata["received_at_beijing"].endswith("+08:00"))
+                        self.assertTrue(metadata["confirmed_at_beijing"].endswith("+08:00"))
+                        self.assertEqual(metadata["server_timezone"], "Asia/Shanghai")
                         self.assertEqual(len(metadata["sam3"]["detections"]), 2)
                         self.assertEqual(metadata["alarm"]["status"], "not_configured")
                         with Image.open(event.annotated) as annotated:
@@ -515,17 +527,22 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(metadata["alarm"]["status"], expected_status)
         self.assertTrue((self.root / ".state" / "alarm-dedup.sqlite3").is_file())
 
-    async def test_save_failure_does_not_invoke_alarm_and_worker_survives(self):
-        with patch("app.alarm.send_alarm", new=AsyncMock()) as alarm:
+    async def test_save_failure_uses_in_memory_alarm_and_worker_survives(self):
+        with patch("app.alarm.send_alarm", new=AsyncMock(return_value=False)) as alarm:
             async with self.running() as (app, client):
                 with patch.object(app.state.pipeline.store, "save", side_effect=OSError("disk full")):
                     await self.upload(client)
                     await app.state.pipeline.drain()
-                    alarm.assert_not_awaited()
+                    alarm.assert_awaited_once()
+                    unsaved = alarm.await_args.args[0]
+                    self.assertIsInstance(unsaved, UnsavedAlarmEvent)
+                    self.assertEqual(unsaved.original, self.data)
+                    self.assertEqual(unsaved.result, "fire")
                 await self.upload(client)
                 await app.state.pipeline.drain()
                 self.assertEqual(app.state.pipeline.counts["save_failed"], 1)
-                alarm.assert_awaited_once()
+                self.assertEqual(app.state.pipeline.counts["alarm_after_save_failure"], 1)
+                self.assertEqual(alarm.await_count, 2)
 
     async def test_alarm_failure_is_not_deduplicated_and_keeps_saved_evidence(self):
         sender = AsyncMock(side_effect=[OSError("unavailable"), True])
@@ -583,6 +600,67 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health["upstreams"], "not_checked")
             self.assertEqual(health["counts"]["accepted"], 1)
 
+    async def test_alarm_state_read_failure_allows_alarm(self):
+        deduplicator = AlarmDeduplicator(self.root, 300)
+        deduplicator.initialize()
+        with patch.object(deduplicator, "_read", side_effect=OSError("disk unavailable")):
+            decision = await deduplicator.reserve("machine-1", "stream-1", "fire")
+        self.assertIsNotNone(decision.reservation)
+        await deduplicator.finish(decision.reservation, sent=False)
+    async def test_future_alarm_timestamp_is_ignored_fail_open(self):
+        deduplicator = AlarmDeduplicator(
+            self.root, 300, future_tolerance_seconds=5,
+        )
+        deduplicator.initialize()
+        with closing(sqlite3.connect(deduplicator.database)) as connection:
+            connection.execute(
+                "INSERT INTO alarm_state(machine_id, stream_id, sent_at, hazards) VALUES (?, ?, ?, ?)",
+                ("machine-1", "stream-1", time.time() + 3600, 1),
+            )
+            connection.commit()
+        decision = await deduplicator.reserve("machine-1", "stream-1", "fire")
+        self.assertIsNotNone(decision.reservation)
+        with closing(sqlite3.connect(deduplicator.database)) as connection:
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM alarm_state WHERE machine_id=? AND stream_id=?",
+                ("machine-1", "stream-1"),
+            ).fetchone())
+        await deduplicator.finish(decision.reservation, sent=False)
+    async def test_readiness_reports_upstream_failure_and_recovers(self):
+        state = {"llm_up": False}
+        stub = Stub(boxes=[])
+
+        async def handler(request):
+            if request.url.path == "/health":
+                if request.url.port == 8080 and not state["llm_up"]:
+                    return httpx.Response(503, json={"status": "down"})
+                return httpx.Response(200, json={"status": "ok"})
+            return await stub(request)
+
+        async with self.running(
+            handler, upstream_health_probes_enabled=True,
+            max_capture_clock_skew_seconds=1000000000,
+        ) as (app, client):
+            self.assertEqual((await client.get("/health/live")).status_code, 200)
+            ready = await client.get("/health/ready")
+            self.assertEqual(ready.status_code, 503)
+            self.assertEqual(ready.json()["upstreams"]["llm"]["status"], "down")
+            self.assertEqual((await self.upload(client)).status_code, 503)
+            state["llm_up"] = True
+            await app.state.monitor.probe_upstreams()
+            self.assertEqual((await client.get("/health/ready")).status_code, 200)
+            self.assertEqual((await self.upload(client)).status_code, 202)
+            await app.state.pipeline.drain()
+
+    async def test_clock_skew_is_recorded_without_rejecting_frame(self):
+        async with self.running(max_capture_clock_skew_seconds=1) as (app, client):
+            self.assertEqual((await self.upload(client)).status_code, 202)
+            await app.state.pipeline.drain()
+            self.assertEqual(app.state.pipeline.counts["capture_clock_skew_warning"], 1)
+            metadata_path = next(self.root.rglob("metadata.json"))
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertTrue(metadata["capture_clock_skew_warning"])
+            self.assertGreater(abs(metadata["capture_clock_skew_seconds"]), 1)
     async def test_shutdown_has_deadline_and_cancels_inflight_work(self):
         entered = asyncio.Event()
 
@@ -614,6 +692,9 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(skipped.remaining_seconds, 20)
         self.assertTrue(gate.admit("machine-2", "stream-1").admitted)
         self.assertTrue(gate.admit("machine-1", "stream-1").admitted)
+        gate.release("machine-1", "stream-1")
+        gate.release("machine-2", "stream-1")
+        self.assertEqual(gate.prune(now=161), 2)
 
     def test_partial_evidence_is_cleaned_when_annotation_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -628,6 +709,111 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).rglob("original.png")), [])
             self.assertEqual(list(Path(directory).rglob(".tmp-*")), [])
 
+    def test_evidence_retention_and_temporary_cleanup_preserve_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = Settings(
+                pipeline_data_dir=root,
+                evidence_retention_days=2,
+                evidence_min_free_bytes=0,
+                evidence_max_usage_percent=99,
+                evidence_target_usage_percent=98,
+                evidence_tmp_max_age_seconds=1,
+                evidence_cleanup_grace_seconds=0,
+                max_capture_clock_skew_seconds=1000000000,
+            )
+            store = EvidenceStore(root, settings=settings)
+            store.initialize()
+            source = frame()
+            candidate = Candidate(source, parse_detections({"results": BOXES}, source), 1.0)
+            result = LLMReply(LLMVerdict(result="fire"), '{"result":"fire"}', "test-model")
+            now = datetime.now(timezone.utc)
+            with patch("app.storage.utc_now", return_value=now - timedelta(days=3)):
+                expired = store.save(candidate, result, 1.0)
+            with patch("app.storage.utc_now", return_value=now):
+                current = store.save(candidate, result, 1.0)
+            abandoned = current.directory.parent / ".tmp-abandoned"
+            abandoned.mkdir()
+            os.utime(abandoned, (time.time() - 10, time.time() - 10))
+            state_file = root / ".state" / "keep.db"
+            state_file.parent.mkdir(exist_ok=True)
+            state_file.write_bytes(b"state")
+
+            report = store.maintain()
+            self.assertFalse(expired.directory.exists())
+            self.assertTrue(current.directory.exists())
+            self.assertFalse(abandoned.exists())
+            self.assertEqual(state_file.read_bytes(), b"state")
+            self.assertEqual(report.expired_events_removed, 1)
+            self.assertEqual(report.temporary_paths_removed, 1)
+
+    def test_evidence_pressure_cleanup_stops_at_target_watermark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = Settings(
+                pipeline_data_dir=root,
+                evidence_retention_days=30,
+                evidence_min_free_bytes=0,
+                evidence_max_usage_percent=85,
+                evidence_target_usage_percent=80,
+                evidence_cleanup_grace_seconds=0,
+            )
+            store = EvidenceStore(root, settings=settings)
+            store.initialize()
+            source = frame()
+            candidate = Candidate(source, parse_detections({"results": BOXES}, source), 1.0)
+            result = LLMReply(LLMVerdict(result="fire"), '{"result":"fire"}', "test-model")
+            store.save(candidate, result, 1.0)
+            store.save(candidate, result, 1.0)
+
+            def disk_usage(_):
+                count = len(list(root.rglob("metadata.json")))
+                return (
+                    SimpleNamespace(total=100, used=90, free=10)
+                    if count >= 2 else SimpleNamespace(total=100, used=75, free=25)
+                )
+
+            with patch("app.storage.shutil.disk_usage", side_effect=disk_usage):
+                report = store.maintain()
+            self.assertEqual(report.pressure_events_removed, 1)
+            self.assertEqual(len(list(root.rglob("metadata.json"))), 1)
+            self.assertLessEqual(report.status.used_percent, 80)
+    def test_invalid_minimum_free_space_does_not_delete_current_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            normal = Settings(
+                pipeline_data_dir=root, evidence_min_free_bytes=0,
+                evidence_max_usage_percent=99, evidence_target_usage_percent=98,
+            )
+            store = EvidenceStore(root, settings=normal)
+            store.initialize()
+            source = frame()
+            candidate = Candidate(source, parse_detections({"results": BOXES}, source), 1.0)
+            result = LLMReply(LLMVerdict(result="fire"), '{"result":"fire"}', "test-model")
+            event = store.save(candidate, result, 1.0)
+            invalid = Settings(
+                pipeline_data_dir=root, evidence_min_free_bytes=10**30,
+                evidence_max_usage_percent=99, evidence_target_usage_percent=98,
+                evidence_cleanup_grace_seconds=0,
+            )
+            report = EvidenceStore(root, settings=invalid).maintain()
+            self.assertFalse(report.status.ready)
+            self.assertIn("exceeds_filesystem_capacity", report.status.detail)
+            self.assertTrue(event.directory.exists())
+            self.assertEqual(report.pressure_events_removed, 0)
+
+    def test_corrupt_alarm_state_is_quarantined_and_recreated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".state"
+            state.mkdir()
+            database = state / "alarm-dedup.sqlite3"
+            database.write_bytes(b"not a sqlite database")
+            deduplicator = AlarmDeduplicator(root, 300)
+            deduplicator.initialize()
+            self.assertTrue(deduplicator.recovered_corruption)
+            self.assertTrue(database.is_file())
+            self.assertEqual(len(list(state.glob("alarm-dedup.corrupt-*.sqlite3"))), 1)
     def test_strict_score_and_box_validation(self):
         source = frame()
         valid = parse_detections({"results": BOXES}, source)
@@ -692,7 +878,8 @@ class ValidationTests(unittest.TestCase):
                         {"llm_stream_cooldown_seconds": -1},
                         {"alarm_stream_cooldown_seconds": float("inf")},
                         {"llm_timeout_seconds": float("inf")}, {"sam3_url": "not a URL"},
-                        {"log_retention_days": 0}, {"log_retention_days": 31}, {"log_level": "INVALID"}):
+                        {"log_retention_days": 0}, {"log_retention_days": 31}, {"log_level": "INVALID"},
+                        {"evidence_target_usage_percent": 90, "evidence_max_usage_percent": 85}):
             with self.subTest(setting=setting), self.assertRaises(ValidationError):
                 Settings(**setting)
 

@@ -1,8 +1,8 @@
 import asyncio
 import hmac
+import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import Annotated
 
 import httpx
@@ -12,13 +12,19 @@ from fastapi.responses import JSONResponse
 from pydantic import AwareDatetime
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from app import __version__
 from app.clients import LLMClient, Sam3Client
 from app.config import Settings
 from app.dedup import AlarmDeduplicator
 from app.domain import Frame
 from app.images import ImageTooLarge, InvalidImage, prepare_image
+from app.monitoring import RuntimeMonitor
 from app.pipeline import Pipeline
 from app.storage import EvidenceStore
+from app.time_utils import as_utc, utc_now
+
+
+logger = logging.getLogger(__name__)
 
 
 class UploadLimitMiddleware:
@@ -32,7 +38,7 @@ class UploadLimitMiddleware:
             await self.app(scope, receive, send)
             return
         state = scope.setdefault("state", {})
-        state["frame_received_at"] = datetime.now(timezone.utc)
+        state["frame_received_at"] = utc_now()
         state["frame_received_monotonic"] = time.monotonic()
         headers = dict(scope.get("headers", []))
         try:
@@ -72,28 +78,40 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         store = EvidenceStore(settings.pipeline_data_dir, settings=settings)
-        await asyncio.to_thread(store.initialize)
+        initial_maintenance = await asyncio.to_thread(store.initialize)
+        logger.info(
+            "evidence_storage_initialized ready=%s used_percent=%.2f free_bytes=%s "
+            "expired_removed=%s pressure_removed=%s temporary_removed=%s",
+            initial_maintenance.status.ready, initial_maintenance.status.used_percent,
+            initial_maintenance.status.free_bytes, initial_maintenance.expired_events_removed,
+            initial_maintenance.pressure_events_removed, initial_maintenance.temporary_paths_removed,
+        )
         alarm_deduplicator = AlarmDeduplicator(
             store.root, settings.alarm_stream_cooldown_seconds,
+            retention_days=settings.alarm_state_retention_days,
+            future_tolerance_seconds=settings.max_capture_clock_skew_seconds,
         )
         await asyncio.to_thread(alarm_deduplicator.initialize)
-        connections = settings.sam3_concurrency + settings.llm_concurrency + 2
+        connections = settings.sam3_concurrency + settings.llm_concurrency + 4
         async with httpx.AsyncClient(
             transport=transport, trust_env=False, follow_redirects=False,
             limits=httpx.Limits(max_connections=connections, max_keepalive_connections=connections),
         ) as http:
-            pipeline = Pipeline(
-                settings, Sam3Client(http, settings), LLMClient(http, settings),
-                store, alarm_deduplicator,
-            )
+            sam3 = Sam3Client(http, settings)
+            llm = LLMClient(http, settings)
+            pipeline = Pipeline(settings, sam3, llm, store, alarm_deduplicator)
+            monitor = RuntimeMonitor(settings, pipeline, sam3, llm, store)
             application.state.pipeline = pipeline
+            application.state.monitor = monitor
             pipeline.start()
+            await monitor.start()
             try:
                 yield
             finally:
+                await monitor.stop()
                 await pipeline.stop()
 
-    application = FastAPI(title="SAM3 + LLM Fire/Smoke Confirmation", version="1.0.0", lifespan=lifespan)
+    application = FastAPI(title="SAM3 + LLM Fire/Smoke Confirmation", version=__version__, lifespan=lifespan)
     application.add_middleware(UploadLimitMiddleware, max_bytes=settings.max_image_bytes + 64 * 1024)
     origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
     if origins:
@@ -117,8 +135,12 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
         ):
             raise HTTPException(401, "Invalid X-API-Key")
         pipeline: Pipeline = request.app.state.pipeline
-        if not pipeline.healthy:
-            return JSONResponse({"accepted": False, "detail": "Service is stopping or unavailable"}, 503)
+        monitor: RuntimeMonitor = request.app.state.monitor
+        if not pipeline.healthy or not monitor.ready:
+            return JSONResponse({
+                "accepted": False,
+                "detail": "Service or required dependency is unavailable",
+            }, 503)
         if pipeline.sam3_queue.full():
             pipeline.counts["rejected_full"] += 1
             return JSONResponse({"accepted": False, "detail": "Queue is full"}, 429)
@@ -133,11 +155,21 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
             raise HTTPException(413, str(exc)) from exc
         except InvalidImage as exc:
             raise HTTPException(400, str(exc)) from exc
+        if captured_at is not None:
+            skew = (as_utc(received_at) - as_utc(captured_at)).total_seconds()
+            if abs(skew) > settings.max_capture_clock_skew_seconds:
+                pipeline.counts["capture_clock_skew_warning"] += 1
+                logger.warning(
+                    "capture_clock_skew machine=%s stream=%s skew_seconds=%.3f",
+                    machine_id, stream_id, skew,
+                )
         frame = Frame(prepared, machine_id, stream_id, stream_name,
                       captured_at, received_at, received_monotonic)
-        # Recheck after image decoding: other requests may have filled the queue.
-        if not pipeline.healthy:
-            return JSONResponse({"accepted": False, "detail": "Service is stopping or unavailable"}, 503)
+        if not pipeline.healthy or not monitor.ready:
+            return JSONResponse({
+                "accepted": False,
+                "detail": "Service or required dependency is unavailable",
+            }, 503)
         try:
             pipeline.submit(frame)
         except asyncio.QueueFull:
@@ -145,15 +177,28 @@ def create_app(settings: Settings | None = None, *, transport: httpx.AsyncBaseTr
             return JSONResponse({"accepted": False, "detail": "Queue is full"}, 429)
         return {"accepted": True}
 
+    def health_response(request: Request, *, require_ready: bool) -> JSONResponse:
+        monitor: RuntimeMonitor = request.app.state.monitor
+        payload = monitor.snapshot()
+        available = monitor.ready if require_ready else monitor.live
+        return JSONResponse(payload, status_code=200 if available else 503)
+
+    @application.get("/health/live")
+    async def live(request: Request):
+        return health_response(request, require_ready=False)
+
+    @application.get("/health/ready")
+    async def ready(request: Request):
+        return health_response(request, require_ready=True)
+
     @application.get("/health")
     async def health(request: Request):
-        pipeline: Pipeline = request.app.state.pipeline
-        return JSONResponse({
-            "status": "ok" if pipeline.healthy else "unavailable",
-            "upstreams": "not_checked",
-            "queues": {"sam3": pipeline.sam3_queue.qsize(), "llm": pipeline.llm_queue.qsize()},
-            "counts": dict(pipeline.counts),
-        }, status_code=200 if pipeline.healthy else 503)
+        return health_response(request, require_ready=True)
+
+    @application.get("/status")
+    async def status(request: Request):
+        monitor: RuntimeMonitor = request.app.state.monitor
+        return JSONResponse(monitor.snapshot())
 
     return application
 
@@ -167,7 +212,6 @@ if __name__ == "__main__":
 
     from app.logging_setup import configured_logging
 
-    # A single API process owns the global queues and log files.
     with configured_logging(settings):
         uvicorn.run(app, host=settings.pipeline_host, port=settings.pipeline_port, workers=1,
                     log_config=None, limit_concurrency=64, timeout_keep_alive=5,

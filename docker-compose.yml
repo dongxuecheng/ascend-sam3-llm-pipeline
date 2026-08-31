@@ -12,7 +12,6 @@ services:
         PIP_INDEX_URL: "${PIP_INDEX_URL}"
     container_name: sam3-llm-pipeline
     restart: unless-stopped
-    # ascend-llm listens on the server's 127.0.0.1:8080.
     network_mode: host
     env_file:
       - .env
@@ -32,11 +31,14 @@ services:
         - CMD
         - python3
         - -c
-        - import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PIPELINE_PORT', '18080') + '/health', timeout=5)
+        - import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PIPELINE_PORT', '18080') + '/health/live', timeout=5)
       interval: 15s
       timeout: 8s
       retries: 3
       start_period: 15s
-    # File logs are the only persistent copy, with a maximum age of 30 days.
+    # Keep a bounded Docker copy for offline troubleshooting; application logs remain authoritative.
     logging:
-      driver: "none"
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"

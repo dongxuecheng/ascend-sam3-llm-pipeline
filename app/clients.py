@@ -69,6 +69,12 @@ class Sam3Client:
     def __init__(self, http: httpx.AsyncClient, settings: Settings):
         self.http, self.settings = http, settings
 
+    async def probe(self) -> None:
+        url = httpx.URL(str(self.settings.sam3_url)).copy_with(path="/health", query=None)
+        async with asyncio.timeout(self.settings.upstream_health_probe_timeout_seconds):
+            response = await self.http.get(url)
+            response.raise_for_status()
+
     async def detect(self, frame: Frame) -> tuple[Detection, ...]:
         async with asyncio.timeout(self.settings.sam3_timeout_seconds):
             response = await self.http.post(
@@ -106,8 +112,14 @@ class LLMClient:
                     self.model = model
         return self.model
 
+    async def probe(self) -> None:
+        url = httpx.URL(self.base_url).copy_with(path="/health", query=None)
+        async with asyncio.timeout(self.settings.upstream_health_probe_timeout_seconds):
+            response = await self.http.get(url, headers=self.headers)
+            response.raise_for_status()
+            await self._model_name()
+
     async def confirm(self, frame: Frame) -> LLMReply:
-        # This deadline includes model discovery and connection-pool waiting.
         async with asyncio.timeout(self.settings.llm_timeout_seconds):
             model = await self._model_name()
             encoded = base64.b64encode(frame.image.inference).decode("ascii")
@@ -127,8 +139,6 @@ class LLMClient:
                 "stream": False,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
-            # Prompt + strict local validation works with the current Ascend image
-            # without requiring an additional structured-decoding backend.
             response = await self.http.post(
                 self.base_url + "/chat/completions", json=payload,
                 headers=self.headers, timeout=self.settings.llm_timeout_seconds,

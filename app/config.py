@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, FiniteFloat, field_validator
+from pydantic import (
+    AnyHttpUrl, BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator,
+)
 
 from app.domain import PROMPT_VERSION, SAM3_CLASSES
 
@@ -52,6 +54,22 @@ class Settings(BaseModel):
     max_image_pixels: int = Field(default=16_000_000, ge=1)
     llm_max_tokens: int = Field(default=128, ge=16, le=512)
 
+    evidence_retention_days: int = Field(default=30, ge=1, le=3650)
+    evidence_max_usage_percent: FiniteFloat = Field(default=85.0, gt=0, le=99)
+    evidence_target_usage_percent: FiniteFloat = Field(default=80.0, ge=0, lt=99)
+    evidence_min_free_bytes: int = Field(default=100 * 1024**3, ge=0)
+    evidence_min_free_inodes_percent: FiniteFloat = Field(default=10.0, ge=0, le=100)
+    evidence_cleanup_interval_seconds: FiniteFloat = Field(default=600.0, gt=0)
+    evidence_tmp_max_age_seconds: FiniteFloat = Field(default=3600.0, gt=0)
+    evidence_cleanup_grace_seconds: FiniteFloat = Field(default=300.0, ge=0)
+    upstream_health_probes_enabled: bool = True
+    upstream_health_probe_interval_seconds: FiniteFloat = Field(default=30.0, gt=0)
+    upstream_health_probe_timeout_seconds: FiniteFloat = Field(default=5.0, gt=0)
+    status_log_interval_seconds: FiniteFloat = Field(default=60.0, gt=0)
+    alarm_required_for_readiness: bool = False
+    max_capture_clock_skew_seconds: FiniteFloat = Field(default=300.0, ge=0)
+    alarm_state_retention_days: int = Field(default=90, ge=1, le=3650)
+
     @field_validator("log_level")
     @classmethod
     def validate_log_level(cls, value: str) -> str:
@@ -66,18 +84,24 @@ class Settings(BaseModel):
         names = [name.strip() for name in value.split(",")]
         if not all(names) or "\n" in value or "\r" in value:
             raise ValueError("SAM3_CLASS_NAMES must contain non-empty, comma-separated prompts on one line")
-        # Preserve spelling/case: SAM3 returns the supplied prompt as its label.
         return ",".join(dict.fromkeys(names))
 
     @field_validator("llm_system_prompt", "llm_user_prompt")
     @classmethod
     def validate_prompt(cls, value: str) -> str:
-        # Legacy Compose env_file values must fit on one physical line.
-        # Only decode literal newline escapes; never unicode_escape Chinese text.
         value = value.replace("\\n", "\n").strip()
         if not value:
             raise ValueError("LLM prompts must not be empty")
         return value
+
+    @model_validator(mode="after")
+    def validate_storage_watermarks(self) -> "Settings":
+        if self.evidence_target_usage_percent >= self.evidence_max_usage_percent:
+            raise ValueError(
+                "EVIDENCE_TARGET_USAGE_PERCENT must be lower than "
+                "EVIDENCE_MAX_USAGE_PERCENT"
+            )
+        return self
 
     @property
     def sam3_classes(self) -> tuple[str, ...]:
@@ -95,7 +119,6 @@ class Settings(BaseModel):
 
     @classmethod
     def from_env(cls) -> "Settings":
-        # Do not reuse generic HOST/PORT/HOME environment variables.
         return cls(**{
             name: os.environ[name.upper()]
             for name in cls.model_fields

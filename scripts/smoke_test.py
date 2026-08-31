@@ -32,6 +32,9 @@ class MockModels(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/health":
+            self.send_json({"status": "ok"})
+            return
         if self.path != "/v1/models":
             self.send_error(404)
             return
@@ -80,6 +83,14 @@ def main():
         "SAM3_CLASS_NAMES", "LLM_SYSTEM_PROMPT", "LLM_USER_PROMPT",
         "PIPELINE_LOG_DIR", "LOG_LEVEL", "LOG_RETENTION_DAYS",
         "LLM_STREAM_COOLDOWN_SECONDS", "ALARM_STREAM_COOLDOWN_SECONDS",
+        "EVIDENCE_RETENTION_DAYS", "EVIDENCE_MAX_USAGE_PERCENT",
+        "EVIDENCE_TARGET_USAGE_PERCENT", "EVIDENCE_MIN_FREE_BYTES",
+        "EVIDENCE_MIN_FREE_INODES_PERCENT", "EVIDENCE_CLEANUP_INTERVAL_SECONDS",
+        "EVIDENCE_TMP_MAX_AGE_SECONDS", "EVIDENCE_CLEANUP_GRACE_SECONDS",
+        "UPSTREAM_HEALTH_PROBES_ENABLED", "UPSTREAM_HEALTH_PROBE_INTERVAL_SECONDS",
+        "UPSTREAM_HEALTH_PROBE_TIMEOUT_SECONDS", "STATUS_LOG_INTERVAL_SECONDS",
+        "ALARM_REQUIRED_FOR_READINESS", "MAX_CAPTURE_CLOCK_SKEW_SECONDS",
+        "ALARM_STATE_RETENTION_DAYS",
     }}
     env.update({
         "PIPELINE_HOST": "127.0.0.1", "PIPELINE_PORT": str(api_port),
@@ -90,6 +101,14 @@ def main():
         "LLM_MODEL": "", "LLM_API_KEY": "", "CORS_ORIGINS": "",
         "SAM3_CONCURRENCY": "4", "LLM_CONCURRENCY": "1",
         "LLM_STREAM_COOLDOWN_SECONDS": "30", "ALARM_STREAM_COOLDOWN_SECONDS": "300",
+        "EVIDENCE_RETENTION_DAYS": "30", "EVIDENCE_MAX_USAGE_PERCENT": "99",
+        "EVIDENCE_TARGET_USAGE_PERCENT": "98", "EVIDENCE_MIN_FREE_BYTES": "0",
+        "EVIDENCE_MIN_FREE_INODES_PERCENT": "0", "EVIDENCE_CLEANUP_INTERVAL_SECONDS": "600",
+        "EVIDENCE_TMP_MAX_AGE_SECONDS": "3600", "EVIDENCE_CLEANUP_GRACE_SECONDS": "300",
+        "UPSTREAM_HEALTH_PROBES_ENABLED": "true", "UPSTREAM_HEALTH_PROBE_INTERVAL_SECONDS": "30",
+        "UPSTREAM_HEALTH_PROBE_TIMEOUT_SECONDS": "3", "STATUS_LOG_INTERVAL_SECONDS": "60",
+        "ALARM_REQUIRED_FOR_READINESS": "false", "MAX_CAPTURE_CLOCK_SKEW_SECONDS": "300",
+        "ALARM_STATE_RETENTION_DAYS": "90",
         "SAM3_QUEUE_SIZE": "15", "LLM_QUEUE_SIZE": "15",
         "SHUTDOWN_TIMEOUT_SECONDS": "2", "PYTHONUNBUFFERED": "1",
     })
@@ -141,6 +160,8 @@ def main():
                 for metadata_file in metadata_files:
                     metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
                     assert metadata["llm"]["result"] == "fire_smoke"
+                    assert metadata["received_at"].endswith("+00:00")
+                    assert metadata["received_at_beijing"].endswith("+08:00")
                     assert metadata["llm"]["model"] == "http-smoke-model"
                     assert (metadata_file.parent / "original.png").read_bytes() == image_bytes
                     assert (metadata_file.parent / "annotated.jpg").is_file()

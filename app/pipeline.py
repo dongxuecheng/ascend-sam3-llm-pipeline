@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections import Counter
-from datetime import datetime, timezone
+
 
 import httpx
 
@@ -14,6 +14,7 @@ from app.config import Settings
 from app.dedup import AlarmDeduplicator, LLMStreamGate
 from app.domain import Candidate, Frame
 from app.storage import EvidenceStore, SavedEvent
+from app.time_utils import as_beijing, utc_now
 
 
 logger = logging.getLogger(__name__)
@@ -154,12 +155,45 @@ class Pipeline:
         self.counts["confirmed"] += 1
         try:
             event = await asyncio.to_thread(self.store.save, candidate, reply, elapsed)
-        except Exception:
+        except Exception as exc:
             self.counts["save_failed"] += 1
             logger.exception(
-                "save_failed machine=%s stream=%s; no alarm invoked",
+                "save_failed machine=%s stream=%s; attempting alarm without persisted evidence",
                 frame.machine_id, frame.stream_id,
             )
+            annotated = None
+            try:
+                annotated = await asyncio.to_thread(self.store._annotate, candidate)
+            except Exception:
+                logger.exception(
+                    "fallback_annotation_failed machine=%s stream=%s",
+                    frame.machine_id, frame.stream_id,
+                )
+            fallback = alarm.UnsavedAlarmEvent(
+                machine_id=frame.machine_id,
+                stream_id=frame.stream_id,
+                result=reply.verdict.result,
+                original=frame.image.original,
+                original_extension=frame.image.original_extension,
+                annotated=annotated,
+                metadata={
+                    "machine_id": frame.machine_id,
+                    "stream_id": frame.stream_id,
+                    "stream_name": frame.stream_name,
+                    "received_at": frame.received_at.isoformat(),
+                    "received_at_beijing": as_beijing(frame.received_at).isoformat(),
+                    "result": reply.verdict.result,
+                    "reason": reply.verdict.reason,
+                    "model": reply.model,
+                    "storage_error_type": type(exc).__name__,
+                    "sam3_detections": [
+                        {"label": item.label, "score": item.score, "box": list(item.box)}
+                        for item in candidate.detections
+                    ],
+                },
+            )
+            self.counts["alarm_after_save_failure"] += 1
+            await self._deliver_alarm(fallback, frame, reply.verdict.result)
             return
         self.counts["saved"] += 1
         logger.info(
@@ -169,7 +203,9 @@ class Pipeline:
         )
         await self._deliver_alarm(event, frame, reply.verdict.result)
 
-    async def _deliver_alarm(self, event: SavedEvent, frame: Frame, result: str) -> None:
+    async def _deliver_alarm(
+        self, event: alarm.AlarmEvent, frame: Frame, result: str,
+    ) -> None:
         decision = await self.alarm_deduplicator.reserve(
             frame.machine_id, frame.stream_id, result,
         )
@@ -197,7 +233,10 @@ class Pipeline:
             await self._update_alarm_metadata(event, {
                 "status": "failed", "error_type": type(exc).__name__,
             })
-            logger.exception("alarm_failed evidence=%s; saved files retained", event.directory)
+            logger.exception(
+                "alarm_failed evidence=%s; local evidence status unchanged",
+                alarm.reference(event),
+            )
             return
 
         if sent is not True:
@@ -215,13 +254,17 @@ class Pipeline:
                 frame.machine_id, frame.stream_id,
             )
         self.counts["alarm_sent"] += 1
+        sent_at = utc_now()
         await self._update_alarm_metadata(event, {
             "status": "sent",
-            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "sent_at": sent_at.isoformat(),
+            "sent_at_beijing": as_beijing(sent_at).isoformat(),
             "dedup_persisted": persisted,
         })
 
-    async def _update_alarm_metadata(self, event: SavedEvent, status: dict) -> None:
+    async def _update_alarm_metadata(self, event: alarm.AlarmEvent, status: dict) -> None:
+        if not isinstance(event, SavedEvent):
+            return
         try:
             await asyncio.to_thread(self.store.update_alarm, event, status)
         except Exception:

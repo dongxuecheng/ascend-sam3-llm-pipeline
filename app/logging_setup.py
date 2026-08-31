@@ -4,15 +4,14 @@ import logging
 import re
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from app.config import Settings
+from app.time_utils import BEIJING_TIMEZONE
 
 
 CLEANUP_INTERVAL_SECONDS = 60
-# Keep timestamps and calendar dates independent of the host timezone and tzdata.
-BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def beijing_today() -> date:
@@ -86,7 +85,11 @@ class AccessLogFilter(logging.Filter):
         client, method, path, version, status = args
         path = str(path).split("?", 1)[0]  # Query strings may contain credentials.
         record.args = client, method, path, version, status
-        return not (method == "GET" and path == "/health" and status == 200)
+        return not (
+            method == "GET"
+            and path in {"/health", "/health/live", "/health/ready", "/status"}
+            and status == 200
+        )
 
 
 @contextmanager
