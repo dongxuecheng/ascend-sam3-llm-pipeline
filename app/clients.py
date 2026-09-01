@@ -10,7 +10,8 @@ import httpx
 
 from app.config import Settings
 from app.domain import (
-    Detection, Frame, LLMReply, LLMVerdict, SAM3_CLASSES, SAM3_THRESHOLD,
+    DEFAULT_SAM3_CONFIDENCE_THRESHOLD, Detection, Frame, LLMReply, LLMVerdict,
+    SAM3_CLASSES,
 )
 
 
@@ -38,6 +39,7 @@ def _number(value: Any) -> float:
 
 def parse_detections(
     payload: Any, frame: Frame, *, class_names: tuple[str, ...] = SAM3_CLASSES,
+    confidence_threshold: float = DEFAULT_SAM3_CONFIDENCE_THRESHOLD,
 ) -> tuple[Detection, ...]:
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
         raise UpstreamError("SAM3 response has no results array")
@@ -50,7 +52,7 @@ def parse_detections(
         score = _number(item.get("score"))
         if not 0 <= score <= 1:
             raise UpstreamError("SAM3 score is outside [0, 1]")
-        if score <= SAM3_THRESHOLD:
+        if score <= confidence_threshold:
             continue
         raw = item.get("box")
         if not isinstance(raw, list) or len(raw) != 4:
@@ -80,12 +82,16 @@ class Sam3Client:
             response = await self.http.post(
                 str(self.settings.sam3_url),
                 data={"class_names": self.settings.sam3_class_names,
-                      "confidence": str(SAM3_THRESHOLD), "return_mask": "false"},
+                      "confidence": str(self.settings.sam3_confidence_threshold),
+                      "return_mask": "false"},
                 files={"image": ("frame", frame.image.inference, frame.image.inference_mime)},
                 timeout=self.settings.sam3_timeout_seconds,
             )
             response.raise_for_status()
-            return parse_detections(response.json(), frame, class_names=self.settings.sam3_classes)
+            return parse_detections(
+                response.json(), frame, class_names=self.settings.sam3_classes,
+                confidence_threshold=self.settings.sam3_confidence_threshold,
+            )
 
 
 class LLMClient:

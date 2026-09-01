@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 SAM3_CLASSES = ("fire", "smoke")
-SAM3_THRESHOLD = 0.3
+DEFAULT_SAM3_CONFIDENCE_THRESHOLD = 0.3
 PROMPT_VERSION = "fire-smoke-v1"
 
 

@@ -45,6 +45,7 @@ class MockModels(BaseHTTPRequestHandler):
         if self.path == "/predict/file":
             assert b'name="return_mask"\r\n\r\nfalse' in body
             assert b'name="class_names"\r\n\r\nfire,smoke' in body
+            assert b'name="confidence"\r\n\r\n0.3' in body
             self.send_json({"results": [
                 {"label": "fire", "score": 0.87, "box": [100, 160, 300, 320]},
                 {"label": "smoke", "score": 0.72, "box": [330, 40, 530, 220]},
@@ -90,7 +91,8 @@ def main():
     env = {key: value for key, value in os.environ.items() if key not in {
         "PIPELINE_HOST", "PIPELINE_PORT", "PIPELINE_DATA_DIR", "PIPELINE_API_KEY",
         "SAM3_URL", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "CORS_ORIGINS",
-        "SAM3_CLASS_NAMES", "LLM_SYSTEM_PROMPT", "LLM_USER_PROMPT",
+        "SAM3_CLASS_NAMES", "SAM3_CONFIDENCE_THRESHOLD",
+        "LLM_SYSTEM_PROMPT", "LLM_USER_PROMPT",
         "PIPELINE_LOG_DIR", "LOG_LEVEL", "LOG_RETENTION_DAYS",
         "LLM_STREAM_COOLDOWN_SECONDS", "ALARM_STREAM_COOLDOWN_SECONDS",
         "EVIDENCE_RETENTION_DAYS", "EVIDENCE_MAX_USAGE_PERCENT",
@@ -109,6 +111,7 @@ def main():
         "SAM3_URL": f"http://127.0.0.1:{model_port}/predict/file",
         "LLM_BASE_URL": f"http://127.0.0.1:{model_port}/v1",
         "LLM_MODEL": "", "LLM_API_KEY": "", "CORS_ORIGINS": "",
+        "SAM3_CONFIDENCE_THRESHOLD": "0.3",
         "SAM3_CONCURRENCY": "4", "LLM_CONCURRENCY": "1",
         "LLM_STREAM_COOLDOWN_SECONDS": "30", "ALARM_STREAM_COOLDOWN_SECONDS": "300",
         "EVIDENCE_RETENTION_DAYS": "30", "EVIDENCE_MAX_USAGE_PERCENT": "99",
@@ -182,6 +185,7 @@ def main():
                 assert log_time.utcoffset() == timedelta(hours=8)
                 assert log_files[0].name == f"pipeline-{log_time.date()}.log"
                 assert "Uvicorn running" in log_text and "pipeline_started" in log_text
+                assert "sam3_confidence_threshold=0.3" in log_text
                 assert log_text.count(" INFO app.pipeline confirmed ") == 15
                 assert "GET /health" not in log_text
                 assert "local-smoke-key" not in log_text and "data:image" not in log_text

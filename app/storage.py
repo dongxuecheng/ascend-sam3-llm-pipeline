@@ -16,7 +16,7 @@ from uuid import uuid4
 from PIL import Image, ImageDraw, ImageFont
 
 from app.config import Settings
-from app.domain import Candidate, LLMReply, SAM3_THRESHOLD
+from app.domain import Candidate, LLMReply
 from app.time_utils import as_beijing, as_utc, utc_now
 
 
@@ -272,7 +272,7 @@ class EvidenceStore:
             },
             "sam3": {
                 "class_names": list(self.settings.sam3_classes),
-                "threshold": SAM3_THRESHOLD,
+                "threshold": self.settings.sam3_confidence_threshold,
                 "detections": [asdict(detection) for detection in candidate.detections],
                 "elapsed_ms": round(candidate.sam3_elapsed_ms, 2),
             },

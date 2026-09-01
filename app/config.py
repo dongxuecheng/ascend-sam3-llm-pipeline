@@ -9,7 +9,7 @@ from pydantic import (
     AnyHttpUrl, BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator,
 )
 
-from app.domain import PROMPT_VERSION, SAM3_CLASSES
+from app.domain import DEFAULT_SAM3_CONFIDENCE_THRESHOLD, PROMPT_VERSION, SAM3_CLASSES
 
 
 DEFAULT_LLM_SYSTEM_PROMPT = "你是严谨的火焰与烟雾图片识别助手。"
@@ -36,6 +36,9 @@ class Settings(BaseModel):
     cors_origins: str = ""
     sam3_url: AnyHttpUrl = "http://127.0.0.1:18000/predict/file"
     sam3_class_names: str = ",".join(SAM3_CLASSES)
+    sam3_confidence_threshold: FiniteFloat = Field(
+        default=DEFAULT_SAM3_CONFIDENCE_THRESHOLD, ge=0, le=1,
+    )
     llm_base_url: AnyHttpUrl = "http://127.0.0.1:8080/v1"
     llm_model: str = ""
     llm_api_key: str = ""

@@ -157,6 +157,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(metadata["llm"]["model"], "test-model")
                         self.assertEqual(metadata["llm"]["prompt_version"], PROMPT_VERSION)
                         self.assertEqual(metadata["sam3"]["class_names"], ["fire", "smoke"])
+                        self.assertEqual(metadata["sam3"]["threshold"], 0.3)
                         self.assertEqual(metadata["stream_name"], "摄像头一")
                         self.assertEqual(metadata["captured_at"], "2026-08-28T10:00:00+08:00")
                         self.assertTrue(metadata["received_at"].endswith("+00:00"))
@@ -200,6 +201,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_custom_words_and_prompts_reach_models_and_saved_evidence(self):
         configured_env = {
             "SAM3_CLASS_NAMES": " flame, dense smoke, flame ",
+            "SAM3_CONFIDENCE_THRESHOLD": "0.65",
             "LLM_SYSTEM_PROMPT": r"你是现场图像审核助手。\n不要猜测。",
             "LLM_USER_PROMPT": r'识别火焰或烟雾。\n只输出{"result":"fire|smoke|fire_smoke|none|uncertain","reason":"可见依据"}',
         }
@@ -209,11 +211,12 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             {**BOXES[0], "label": "flame"},
             {**BOXES[1], "label": "dense smoke"},
             BOXES[0],  # A label not in the configured list must still be ignored.
-            {**BOXES[0], "label": "flame", "score": 0.3},
+            {**BOXES[0], "label": "flame", "score": 0.65},
         ], llm_result="fire_smoke")
         with patch("app.alarm.send_alarm", new=AsyncMock()) as alarm:
             async with self.running(
                 stub, sam3_class_names=settings.sam3_class_names,
+                sam3_confidence_threshold=settings.sam3_confidence_threshold,
                 llm_system_prompt=settings.llm_system_prompt,
                 llm_user_prompt=settings.llm_user_prompt,
             ) as (app, client):
@@ -222,7 +225,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 alarm.assert_awaited_once()
                 sam_request, llm_request = stub.requests
                 self.assertIn(b'name="class_names"\r\n\r\nflame,dense smoke', sam_request.content)
-                self.assertIn(b'name="confidence"\r\n\r\n0.3', sam_request.content)
+                self.assertIn(b'name="confidence"\r\n\r\n0.65', sam_request.content)
                 self.assertIn(b'name="return_mask"\r\n\r\nfalse', sam_request.content)
                 payload = json.loads(llm_request.content)
                 self.assertEqual(payload["messages"][0]["content"], "你是现场图像审核助手。\n不要猜测。")
@@ -231,6 +234,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 event = alarm.await_args.args[0]
                 metadata = json.loads(event.metadata.read_text(encoding="utf-8"))
                 self.assertEqual(metadata["sam3"]["class_names"], ["flame", "dense smoke"])
+                self.assertEqual(metadata["sam3"]["threshold"], 0.65)
                 self.assertEqual(
                     [item["label"] for item in metadata["sam3"]["detections"]],
                     ["flame", "dense smoke"],
@@ -266,13 +270,16 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_threshold_is_strict_and_no_candidate_never_calls_llm(self):
         stub = Stub(boxes=[
-            {"label": "fire", "score": 0.3, "box": [10, 20, 70, 100]},
-            {"label": "smoke", "score": 0.2, "box": [90, 30, 150, 100]},
+            {"label": "fire", "score": 0.6, "box": [10, 20, 70, 100]},
+            {"label": "smoke", "score": 0.59, "box": [90, 30, 150, 100]},
         ])
-        async with self.running(stub) as (app, client):
+        async with self.running(stub, sam3_confidence_threshold=0.6) as (app, client):
             self.assertEqual((await self.upload(client)).status_code, 202)
             await app.state.pipeline.drain()
             self.assertEqual(len(stub.requests), 1)
+            self.assertIn(
+                b'name="confidence"\r\n\r\n0.6', stub.requests[0].content,
+            )
             self.assertEqual(app.state.pipeline.counts["sam3_negative"], 1)
             self.assertEqual(list(self.root.rglob("metadata.json")), [])
 
@@ -919,6 +926,9 @@ class ValidationTests(unittest.TestCase):
 
     def test_unbounded_queue_or_nonfinite_timeout_cannot_be_configured(self):
         for setting in ({"sam3_queue_size": 0}, {"llm_concurrency": 0},
+                        {"sam3_confidence_threshold": -0.1},
+                        {"sam3_confidence_threshold": 1.1},
+                        {"sam3_confidence_threshold": float("nan")},
                         {"llm_stream_cooldown_seconds": -1},
                         {"alarm_stream_cooldown_seconds": float("inf")},
                         {"llm_timeout_seconds": float("inf")}, {"sam3_url": "not a URL"},

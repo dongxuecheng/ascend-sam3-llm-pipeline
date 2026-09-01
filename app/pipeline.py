@@ -46,10 +46,11 @@ class Pipeline:
         self.accepting = True
         logger.info(
             "pipeline_started sam3_workers=%s llm_workers=%s sam3_queue_limit=%s "
-            "llm_queue_limit=%s llm_stream_cooldown_seconds=%s "
-            "alarm_stream_cooldown_seconds=%s",
+            "llm_queue_limit=%s sam3_confidence_threshold=%s "
+            "llm_stream_cooldown_seconds=%s alarm_stream_cooldown_seconds=%s",
             self.settings.sam3_concurrency, self.settings.llm_concurrency,
             self.sam3_queue.maxsize, self.llm_queue.maxsize,
+            self.settings.sam3_confidence_threshold,
             self.settings.llm_stream_cooldown_seconds,
             self.settings.alarm_stream_cooldown_seconds,
         )
