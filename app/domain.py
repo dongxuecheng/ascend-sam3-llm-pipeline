@@ -49,7 +49,7 @@ class Candidate:
 class LLMVerdict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     result: Literal["fire", "smoke", "fire_smoke", "none", "uncertain"]
-    reason: str = Field(default="", max_length=512)
+    reason: str = Field(max_length=512)
 
     @property
     def confirmed(self) -> bool:

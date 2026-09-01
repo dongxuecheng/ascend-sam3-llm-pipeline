@@ -182,15 +182,18 @@ Content-Type / boundary，由 curl、浏览器 FormData 或 HTTP 客户端生成
 - 冷却、执行中、普通阴性或不确定图片不保存；每张经 LLM 确认的图片仍独立保存。
 
 LLM 使用当前 ascend-llm 的 /chat/completions 接口，关闭思考模式，
-temperature=0，输出限制默认 128 tokens。输出需要是严格 JSON：
+temperature=0，输出限制默认 128 tokens。每次请求都通过 OpenAI 兼容的
+response_format=json_schema 把生成约束为以下 JSON 结构：
 
 ~~~json
 {"result": "fire", "reason": "可见橙色火焰"}
 ~~~
 
-result 只允许 fire、smoke、fire_smoke、none、uncertain。
-前三种保存；后两种跳过。无效 JSON、未知枚举、截断回复、请求失败、超时都跳过。
-为兼容现有 Ascend 镜像，不强制依赖额外的结构化解码插件。
+Schema 要求 result 和 reason 两个字段都存在，禁止额外字段；result 只允许
+fire、smoke、fire_smoke、none、uncertain。前三种保存；后两种跳过。
+当前使用的 vllm-ascend:v0.23.0 原生支持该结构化输出，服务端默认启用，
+不需要额外插件或启动参数。pipeline 收到回复后仍执行严格 JSON 和 Pydantic 校验，
+用于防御上游 HTTP 响应损坏、截断或服务端异常；这些失败仍直接跳过，不会重试。
 当前模型名会缓存，切换上游模型后需重启本服务或明确更新 LLM_MODEL。
 
 ### 检测词与提示词配置

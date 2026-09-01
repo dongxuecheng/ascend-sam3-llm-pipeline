@@ -52,6 +52,16 @@ class MockModels(BaseHTTPRequestHandler):
         elif self.path == "/v1/chat/completions":
             payload = json.loads(body)
             assert payload["chat_template_kwargs"]["enable_thinking"] is False
+            response_format = payload["response_format"]
+            assert response_format["type"] == "json_schema"
+            assert response_format["json_schema"]["name"] == "fire_smoke_verdict"
+            assert response_format["json_schema"]["strict"] is True
+            schema = response_format["json_schema"]["schema"]
+            assert schema["required"] == ["result", "reason"]
+            assert schema["additionalProperties"] is False
+            assert schema["properties"]["result"]["enum"] == [
+                "fire", "smoke", "fire_smoke", "none", "uncertain",
+            ]
             self.send_json({"choices": [{"message": {"content": json.dumps({
                 "result": "fire_smoke", "reason": "Synthetic test response; not real model inference",
             })}, "finish_reason": "stop"}]})

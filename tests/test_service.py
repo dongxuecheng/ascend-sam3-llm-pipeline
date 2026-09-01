@@ -175,6 +175,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                         url = payload["messages"][1]["content"][0]["image_url"]["url"]
                         self.assertEqual(base64.b64decode(url.split(",", 1)[1]), self.data)
                         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+                        response_format = payload["response_format"]
+                        self.assertEqual(response_format["type"], "json_schema")
+                        self.assertEqual(
+                            response_format["json_schema"]["name"], "fire_smoke_verdict",
+                        )
+                        self.assertIs(response_format["json_schema"]["strict"], True)
+                        self.assertEqual(
+                            response_format["json_schema"]["schema"],
+                            LLMVerdict.model_json_schema(),
+                        )
+                        self.assertEqual(
+                            response_format["json_schema"]["schema"]["required"],
+                            ["result", "reason"],
+                        )
+                        self.assertIs(
+                            response_format["json_schema"]["schema"]["additionalProperties"],
+                            False,
+                        )
                         self.assertEqual(payload["temperature"], 0)
                         self.assertEqual(payload["messages"][0]["content"], DEFAULT_LLM_SYSTEM_PROMPT)
                         self.assertEqual(payload["messages"][1]["content"][1]["text"], DEFAULT_LLM_USER_PROMPT)
@@ -712,7 +730,7 @@ class ValidationTests(unittest.TestCase):
             store.initialize()
             source = frame()
             candidate = Candidate(source, parse_detections({"results": BOXES}, source), 1.0)
-            result = LLMReply(LLMVerdict(result="fire"), '{"result":"fire"}', "test-model")
+            result = LLMReply(LLMVerdict(result="fire", reason="visible evidence"), '{"result":"fire"}', "test-model")
             with patch.object(store, "_annotate", side_effect=OSError("write failure")):
                 with self.assertRaises(OSError):
                     store.save(candidate, result, 1.0)
@@ -736,7 +754,7 @@ class ValidationTests(unittest.TestCase):
             store.initialize()
             source = frame()
             candidate = Candidate(source, parse_detections({"results": BOXES}, source), 1.0)
-            result = LLMReply(LLMVerdict(result="fire"), '{"result":"fire"}', "test-model")
+            result = LLMReply(LLMVerdict(result="fire", reason="visible evidence"), '{"result":"fire"}', "test-model")
             now = datetime.now(timezone.utc)
             with patch("app.storage.utc_now", return_value=now - timedelta(days=3)):
                 expired = store.save(candidate, result, 1.0)
@@ -782,7 +800,7 @@ class ValidationTests(unittest.TestCase):
             store.initialize()
             source = frame()
             candidate = Candidate(source, parse_detections({"results": BOXES}, source), 1.0)
-            result = LLMReply(LLMVerdict(result="fire"), '{"result":"fire"}', "test-model")
+            result = LLMReply(LLMVerdict(result="fire", reason="visible evidence"), '{"result":"fire"}', "test-model")
             store.save(candidate, result, 1.0)
             store.save(candidate, result, 1.0)
 
@@ -809,7 +827,7 @@ class ValidationTests(unittest.TestCase):
             store.initialize()
             source = frame()
             candidate = Candidate(source, parse_detections({"results": BOXES}, source), 1.0)
-            result = LLMReply(LLMVerdict(result="fire"), '{"result":"fire"}', "test-model")
+            result = LLMReply(LLMVerdict(result="fire", reason="visible evidence"), '{"result":"fire"}', "test-model")
             event = store.save(candidate, result, 1.0)
             invalid = Settings(
                 pipeline_data_dir=root, evidence_min_free_bytes=10**30,
@@ -865,7 +883,13 @@ class ValidationTests(unittest.TestCase):
     def test_unknown_and_non_string_conclusions_cannot_be_confirmed(self):
         for result in (True, 1, "yes", "fire and smoke", None):
             with self.subTest(result=result), self.assertRaises(ValidationError):
-                LLMVerdict.model_validate({"result": result})
+                LLMVerdict.model_validate({"result": result, "reason": "visible evidence"})
+        with self.assertRaises(ValidationError):
+            LLMVerdict.model_validate({"result": "none"})
+        with self.assertRaises(ValidationError):
+            LLMVerdict.model_validate({
+                "result": "none", "reason": "no visible hazard", "unexpected": True,
+            })
 
     def test_invalid_detection_words_and_empty_prompts_fail_startup_validation(self):
         for value in ("", " ", ",", "fire,,smoke", "fire,", "fire,\nsmoke"):

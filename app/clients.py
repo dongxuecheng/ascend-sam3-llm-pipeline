@@ -123,6 +123,7 @@ class LLMClient:
         async with asyncio.timeout(self.settings.llm_timeout_seconds):
             model = await self._model_name()
             encoded = base64.b64encode(frame.image.inference).decode("ascii")
+            response_schema = LLMVerdict.model_json_schema()
             payload = {
                 "model": model,
                 "messages": [
@@ -138,6 +139,14 @@ class LLMClient:
                 "max_tokens": self.settings.llm_max_tokens,
                 "stream": False,
                 "chat_template_kwargs": {"enable_thinking": False},
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "fire_smoke_verdict",
+                        "schema": response_schema,
+                        "strict": True,
+                    },
+                },
             }
             response = await self.http.post(
                 self.base_url + "/chat/completions", json=payload,
